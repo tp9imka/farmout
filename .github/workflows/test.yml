@@ -1,0 +1,23 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Tools
+        run: command -v jq || { sudo apt-get update && sudo apt-get install -y jq; }
+      - name: git identity for test repos
+        run: git config --global user.name ci && git config --global user.email ci@example.com
+      - name: CLI tests (bash)
+        run: bash tests/run.sh
+      - name: Dashboard tests (python)
+        run: cd arcade && python3 -m unittest discover -s tests -q
+      - name: Dashboard tests (js)
+        run: cd arcade && node --test 'tests/js/*.test.mjs'

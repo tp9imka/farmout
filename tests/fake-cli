@@ -1,0 +1,29 @@
+#!/bin/bash
+# Test worker. Runs every "FAKE: <verb> <args>" line of the brief ($1), in order.
+set -f
+brief="$1"
+while IFS= read -r line; do
+  case "$line" in FAKE:*) ;; *) continue ;; esac
+  set -- ${line#FAKE:}
+  verb="$1"; shift
+  case "$verb" in
+    print) echo "$*" ;;
+    echo-brief) printf '%s\n' "$brief" ;;
+    cat) cat "$1" ;;
+    write) f="$1"; shift; printf '%s\n' "$*" > "$f" ;;
+    sed) e="$1"; f="$2"; /usr/bin/sed -i "" "$e" "$f" ;;
+    trailing-ws) printf 'four \n' >> "$1" ;;
+    ln) ln -s "$1" "$2" ;;
+    mkdir) mkdir -p "$1" ;;
+    lock-index) touch "$(git rev-parse --git-dir)/index.lock" ;;
+    env) eval "echo \"\${$1}\"" ;;
+    stderr) echo "$*" >&2 ;;
+    sleep) sleep "$1" ;;
+    spawn) sleep 600 & ;;
+    hang) sleep 600 ;;
+    exit) exit "$1" ;;
+  esac
+done <<EOF
+$brief
+EOF
+exit 0

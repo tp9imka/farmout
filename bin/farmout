@@ -1,0 +1,850 @@
+#!/bin/bash
+# farmout - run a task on another agent CLI in an isolated git worktree.
+# Usage: farmout {run|status|result|kill|land|discard|clean|doctor} ...
+
+SELF="$0"
+while [ -L "$SELF" ]; do
+  link="$(readlink "$SELF")"
+  case "$link" in /*) SELF="$link" ;; *) SELF="$(dirname "$SELF")/$link" ;; esac
+done
+FARMOUT_ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+SELF="$FARMOUT_ROOT/bin/farmout"
+. "$FARMOUT_ROOT/lib/common.sh"
+. "$FARMOUT_ROOT/lib/adapters.sh"
+. "$FARMOUT_ROOT/lib/config.sh"
+
+TITLE_MAX=80
+
+usage() {
+  usage_text >&2
+  exit 2
+}
+
+usage_text() {
+  cat <<'EOF'
+farmout - hand a task to another coding-agent CLI (codex, kiro, copilot,
+cursor) in an isolated git worktree, then review and land its work.
+
+usage: farmout run <cli|auto> [--write] [--model M] [--effort E] [--kind K]
+                    [--title T] [--timeout 30m] [--with <path>]... [--out <glob>]...
+                    [--repo <path>] [--ref <rev>] [--no-repo] [--queue] --brief <file>
+       farmout status [job]
+       farmout result <job>
+       farmout progress <job>
+       farmout rate <job> <verified>/<total> [note]
+       farmout scores
+       farmout kill <job>
+       farmout land <job>
+       farmout discard <job>
+       farmout clean [--all] [--mine]
+       farmout doctor [--json]
+       farmout arcade [--port P] [--no-open]
+       farmout version | help
+EOF
+}
+
+require_job() { # id -> sets JOB
+  [ -n "$1" ] || usage
+  JOB="$(job_dir "$1")"
+  [ -f "$JOB/meta.json" ] || die "no such job: $1"
+}
+
+# Status for display: a "running" job whose supervisor (the farmout run
+# process) is dead has lost its session. The worker may still be alive;
+# kill/clean/discard reap its process group.
+effective_status() { # jobdir
+  local s sup
+  s="$(meta_get "$1" status)"
+  if [ "$s" = running ]; then
+    sup="$(meta_get "$1" sup_pid)"
+    if [ -z "$sup" ] || ! pid_alive "$sup"; then s=lost; fi
+  fi
+  echo "$s"
+}
+
+# The first sentence of the first prose paragraph of a brief (headings and
+# blank lead-in lines skipped), capped at 80 chars. Used when --title is not given.
+derive_title() { # brief-file
+  local para
+  para="$(awk '
+    /^#/ { next }
+    /^[[:space:]]*$/ { if (p != "") { print p; exit } next }
+    { p = (p == "" ? $0 : p " " $0) }
+    END { if (p != "") print p }
+  ' "$1")"
+  first_sentence "$para"
+}
+first_sentence() { # text
+  local s="$1" cut
+  cut="${s%%[.!?]*}"
+  [ "$cut" != "$s" ] && s="$cut${s:${#cut}:1}"
+  echo "${s:0:$TITLE_MAX}"
+}
+
+remove_worktree() { # jobdir
+  local repo wt branch
+  repo="$(meta_get "$1" repo)"; wt="$(meta_get "$1" worktree)"; branch="$(meta_get "$1" branch)"
+  [ -n "$wt" ] && [ -d "$wt" ] && git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1
+  git -C "$repo" worktree prune >/dev/null 2>&1
+  [ -n "$branch" ] && git -C "$repo" branch -D "$branch" >/dev/null 2>&1
+  # A --no-repo job's scratch repo has no use once its worktree is gone.
+  local scratch; scratch="$(meta_get "$1" scratch)"
+  case "$scratch" in "$FARMOUT_HOME"/scratch/*) rm -rf "$scratch" ;; esac
+  return 0
+}
+
+make_scratch_repo() {
+  local d
+  mkdir -p "$FARMOUT_HOME/scratch" && d="$(mktemp -d "$FARMOUT_HOME/scratch/repo.XXXXXX")" || return 1
+  git -C "$d" init -q && GIT_AUTHOR_NAME=farmout GIT_AUTHOR_EMAIL=farmout@localhost \
+    GIT_COMMITTER_NAME=farmout GIT_COMMITTER_EMAIL=farmout@localhost \
+    git -C "$d" commit -q --allow-empty -m "farmout scratch" || { rm -rf "$d"; return 1; }
+  echo "$d"
+}
+
+# auto's routing rule for --kind: prefer if usable, else fallback if usable,
+# else die with both candidates' reasons. Sets CLI_CHOSEN and ROUTE (recorded
+# as meta.route) and prints the choice to stderr. Called as a plain
+# statement (never inside a command substitution), so die's exit reaches the
+# whole process.
+route_auto() { # kind
+  local kind="$1" rows prefer fallback reason
+  rows="$(cfg_routing_for_kind "$kind")" || die "no routing rule for kind '$kind'"
+  prefer="$(printf '%s\n' "$rows" | sed -n 1p)"
+  fallback="$(printf '%s\n' "$rows" | sed -n 2p)"
+
+  if adapter_usable "$prefer"; then
+    CLI_CHOSEN="$prefer"; ROUTE="prefer $prefer"
+    warn "routing $kind -> $prefer (prefer)"
+    return 0
+  fi
+  reason="$ADAPTER_UNUSABLE_REASON"
+
+  if [ -n "$fallback" ] && adapter_usable "$fallback"; then
+    CLI_CHOSEN="$fallback"; ROUTE="fallback $fallback: $reason"
+    warn "routing $kind -> $fallback (fallback; prefer $prefer is $reason)"
+    return 0
+  fi
+  if [ -n "$fallback" ]; then
+    die "no usable cli for kind '$kind': $prefer ($reason), $fallback ($ADAPTER_UNUSABLE_REASON)"
+  fi
+  die "no usable cli for kind '$kind': $prefer ($reason)"
+}
+
+# Max jobs, admission by counting peers (no lock, no id order). Job ids only
+# have one-second resolution plus a random tiebreak, so id order is not
+# arrival order (found in T2 review) - counting live peers instead of
+# comparing ids removes the dependency on that order entirely.
+#
+# Scans every OTHER job dir and prints two numbers, "overall running":
+#   overall = admitted jobs whose effective status is running
+#           + unadmitted jobs whose sup_pid is alive
+#           + dirs with an unparsable meta.json (counted, to be safe)
+#   running = the admitted-running count alone (for the immediate-reject
+#             fast path below - an ambiguous or unparsable peer must not
+#             fast-reject, only push this job into a retry).
+# Dirs with no meta.json yet are ignored: their owner writes its meta before
+# its own scan, so a later scan here will count it once it exists.
+admission_scan() { # id
+  local id="$1" d other meta admitted status sup overall=0 running=0
+  for d in "$FARMOUT_HOME"/jobs/*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"; other="$(basename "$d")"
+    [ "$other" = "$id" ] && continue
+    [ -f "$d/meta.json" ] || continue
+    meta="$(cat "$d/meta.json" 2>/dev/null)"
+    if ! printf '%s' "$meta" | jq -e . >/dev/null 2>&1; then
+      overall=$((overall + 1))
+      continue
+    fi
+    admitted="$(printf '%s' "$meta" | jq -r '.admitted // false')"
+    if [ "$admitted" = true ]; then
+      [ "$(effective_status "$d")" = running ] && { overall=$((overall + 1)); running=$((running + 1)); }
+    else
+      # An old meta with no "admitted" field lands here too. Its status must
+      # be "running" as well as its sup_pid alive - a finished job whose
+      # sup_pid was since reused by an unrelated live process must not block.
+      status="$(printf '%s' "$meta" | jq -r '.status // empty')"
+      sup="$(printf '%s' "$meta" | jq -r '.sup_pid // empty')"
+      [ "$status" = running ] && [ -n "$sup" ] && pid_alive "$sup" && overall=$((overall + 1))
+    fi
+  done
+  echo "$overall $running"
+}
+
+# Test-only: blocks between deciding to admit and flipping admitted:true, so
+# a test can hold a job in its "claimed but not yet admitted" state and
+# prove peers still see it. Touches "<path>.paused" first so a test can
+# detect the block point without a race.
+admit_test_pause() {
+  [ -n "${FARMOUT_TEST_ADMIT_PAUSE:-}" ] || return 0
+  : > "${FARMOUT_TEST_ADMIT_PAUSE}.paused"
+  read -r _ < "$FARMOUT_TEST_ADMIT_PAUSE" 2>/dev/null
+}
+
+admit_jitter() { awk -v r="$RANDOM" -v m="$ADMIT_JITTER_MAX_S" 'BEGIN{printf "%.3f", (r % 1000) / 1000 * m}'; }
+
+# --queue: wait for a slot in enqueue order instead of exit 4. A waiter holds
+# only a ticket file (named by enqueue time, holding its pid), never a job dir:
+# an unadmitted job dir counts as taking a slot. Only the oldest live ticket
+# tries admission; tickets whose process died are dropped, so a killed waiter
+# never blocks the line.
+QUEUE_DIR="$FARMOUT_HOME/queue"
+admit_queued() { # id job max_jobs meta_json
+  local id="$1" job="$2" max="$3" meta_json="$4" ticket t first
+  mkdir -p "$QUEUE_DIR"
+  ticket="$QUEUE_DIR/$(perl -MTime::HiRes=time -e 'printf "%017.6f", time')-$id"
+  echo "$$" > "$ticket"
+  trap 'rm -f "$ticket"' EXIT
+  rm -rf "$job"
+  local announced=false
+  while :; do
+    first=""
+    for t in "$QUEUE_DIR"/*; do
+      [ -f "$t" ] || continue
+      pid_alive "$(cat "$t" 2>/dev/null)" || { rm -f "$t"; continue; }
+      first="$t"; break
+    done
+    if [ "$first" = "$ticket" ]; then
+      mkdir "$job" 2>/dev/null || die "internal: could not claim job dir $job"
+      if ADMIT_RETURN_FULL=true admit_job "$id" "$job" "$max" "$meta_json"; then
+        rm -f "$ticket"; trap - EXIT
+        return 0
+      fi
+    fi
+    $announced || { echo "farmout: queued $id for a slot (max $max concurrent jobs)" >&2; announced=true; }
+    sleep "$QUEUE_POLL_S"
+  done
+}
+
+# Claims (mkdir), writes meta (admitted:false already in it), scans peers,
+# and either flips admitted:true and returns 0 (the worktree may now be
+# created), or removes the dir and retries after a jitter, up to
+# ADMIT_ATTEMPTS. The dir at <job> must already exist (claimed by the
+# caller) on the first call. Why over-admission can't happen: of any two
+# admitted jobs, whichever wrote its meta later did its scan strictly after
+# the other's write had completed, so it counted it (as admitted-running or
+# as unadmitted-but-alive) - there is no gap in which both believe they are
+# under the limit.
+admit_job() { # id job max_jobs meta_json
+  local id="$1" job="$2" max="$3" meta_json="$4" attempt=1 scan overall running
+  while :; do
+    meta_write "$job" "$meta_json"
+
+    scan="$(admission_scan "$id")"
+    overall="${scan% *}"; running="${scan#* }"
+
+    if [ "$overall" -lt "$max" ]; then
+      admit_test_pause
+      # started = admission: a queued job's wait is not run time (elapsed,
+      # the dashboard's stall clock and the timeout all count from here).
+      meta_set "$job" --arg at "$(now_iso)" '.admitted = true | .admitted_at = $at | .queued_at = .started | .started = $at'
+      return 0
+    fi
+    if [ "$running" -ge "$max" ] || [ "$attempt" -ge "$ADMIT_ATTEMPTS" ]; then
+      rm -rf "$job"
+      ${ADMIT_RETURN_FULL:-false} && return 4
+      echo "farmout: at max concurrent jobs ($max); try later (or use --queue)" >&2
+      exit 4
+    fi
+    rm -rf "$job"
+    sleep "$(admit_jitter)"
+    mkdir "$job" 2>/dev/null || die "internal: could not reclaim job dir $job on admission retry $attempt"
+    attempt=$((attempt + 1))
+  done
+}
+
+cmd_run() {
+  local cli="${1:-}"; shift || true
+  local write=false model="" effort="" timeout_flag="" title="" kind="" brief="" route=""
+  local with_paths=() out_globs=() repo_flag="" ref="" no_repo=false queue=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --write) write=true ;;
+      --model) model="$2"; shift ;;
+      --effort) effort="$2"; shift ;;
+      --timeout) timeout_flag="$2"; shift ;;
+      --title) title="$2"; shift ;;
+      --kind) kind="$2"; shift ;;
+      --brief) brief="$2"; shift ;;
+      --with) [ -n "${2:-}" ] || usage; with_paths+=("$2"); shift ;;
+      --out) [ -n "${2:-}" ] || usage; out_globs+=("$2"); shift ;;
+      --repo) [ -n "${2:-}" ] || usage; repo_flag="$2"; shift ;;
+      --ref) [ -n "${2:-}" ] || usage; ref="$2"; shift ;;
+      --no-repo) no_repo=true ;;
+      --queue) queue=true ;;
+      *) usage ;;
+    esac
+    shift
+  done
+  [ "$cli" = auto ] || adapter_known "$cli" || die "unknown cli '$cli' (known: $ADAPTERS, or auto)"
+  [ -n "$brief" ] && [ -f "$brief" ] || die "--brief <file> is required"
+  [ -z "$kind" ] || cfg_valid_kind "$kind" || die "unknown kind '$kind' (known: $CFG_KINDS)"
+  [ "$cli" != auto ] || [ -n "$kind" ] || die "auto requires --kind"
+  [ -z "$model" ] || cfg_valid_model "$model" || die "invalid --model '$model'"
+  [ -z "$effort" ] || cfg_valid_effort "$effort" || die "invalid --effort '$effort' (want low, medium, or high)"
+
+  cfg_load
+  if [ "$cli" = auto ]; then
+    route_auto "$kind"
+    cli="$CLI_CHOSEN"; route="$ROUTE"
+  else
+    adapter_usable "$cli" || die "cli '$cli' is $ADAPTER_UNUSABLE_REASON"
+  fi
+
+  local timeout_s
+  if [ -n "$timeout_flag" ]; then
+    timeout_s="$(parse_duration "$timeout_flag")" || die "bad --timeout '$timeout_flag'"
+  else
+    local cfg_timeout_min; cfg_timeout_min="$(cfg_worker "$cli" timeout_min)"
+    if [ -n "$cfg_timeout_min" ]; then
+      timeout_s=$((cfg_timeout_min * 60))
+    else
+      timeout_s="$(parse_duration "$DEFAULT_TIMEOUT")" || die "bad FARMOUT_TIMEOUT '$DEFAULT_TIMEOUT'"
+    fi
+  fi
+  [ "$timeout_s" -ge 1 ] || die "bad timeout: minimum is 1s"
+
+  [ -n "$model" ] || model="$(cfg_worker "$cli" model)"
+  [ -n "$effort" ] || effort="$(cfg_worker "$cli" effort)"
+  local effort_final; effort_final="$(adapter_effective_effort "$cli" "$model" "$effort")"
+  [ -n "$title" ] || title="$(derive_title "$brief")"
+
+  # Where the snapshot comes from: --repo, else the cwd's repo. A job that
+  # needs no code (--no-repo, or a research job run outside any repo) gets an
+  # empty scratch repo, so every job keeps the same worktree code path.
+  local repo scratch=""
+  if $no_repo; then
+    [ -z "$repo_flag$ref" ] || die "--no-repo cannot be combined with --repo or --ref"
+  elif [ -n "$repo_flag" ]; then
+    repo="$(git -C "$repo_flag" rev-parse --show-toplevel 2>/dev/null)" || die "--repo '$repo_flag' is not inside a git repository"
+  elif ! repo="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    [ "$kind" = research ] && [ -z "$ref" ] || die "not inside a git repository; refusing to run an auto-approved agent unisolated (use --repo, or --no-repo for a job that needs no code)"
+    no_repo=true
+  fi
+  if $no_repo; then
+    $write && die "a job with no repo is read-only; hand files back with --out"
+    [ ${#with_paths[@]} -eq 0 ] || die "--with needs a repo"
+    scratch="$(make_scratch_repo)" || die "could not create a scratch repo"
+    repo="$scratch"
+  fi
+  local source_branch; source_branch="$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null)"
+
+  # The worker runs in a separate worktree; an absolute path into the source
+  # checkout would let an auto-approved worker edit the source directly.
+  grep -qF "$repo/" "$brief" \
+    && die "brief contains the source checkout's absolute path ($repo/); use repo-relative paths - the worker runs in a separate worktree"
+
+  # --out: files a read job hands back (reports); copied out before its
+  # worktree goes. Write jobs return files through diff.patch instead.
+  local o
+  for o in ${out_globs[@]+"${out_globs[@]}"}; do
+    $write && die "--out is for read jobs; a write job's files come back in its patch"
+    case "$o" in /*|..|../*|*/../*|*/..) die "--out '$o' must be a path relative to the repo root, inside it" ;; esac
+  done
+
+  # --with: repo-relative files (typically untracked) the worker must see.
+  local w
+  for w in ${with_paths[@]+"${with_paths[@]}"}; do
+    case "$w" in /*|..|../*|*/../*|*/..) die "--with '$w' must be a path relative to the repo root, inside it" ;; esac
+    [ -f "$repo/$w" ] || die "--with '$w' is not a file in $(basename "$repo")"
+  done
+
+  # Snapshot before claiming an id: a job dir, once created, must always get a
+  # meta.json (below), so nothing here may die after claim_job_id.
+  local snap untracked stash_rc head tree
+  head="$(git -C "$repo" rev-parse HEAD 2>/dev/null)" || die "repository has no commits"
+  if [ -n "$ref" ]; then
+    # Exactly that commit: the working tree (dirty edits, branch) is ignored.
+    head="$(git -C "$repo" rev-parse --verify --quiet "$ref^{commit}")" || die "--ref '$ref' is not a commit in $(basename "$repo")"
+    snap="$head"; stash_rc=0
+  else
+    snap="$(git -C "$repo" stash create 2>/dev/null)"; stash_rc=$?
+  fi
+  # A failed stash create can still leak a fragment of its error text to
+  # stdout (e.g. "a.txt: needs merge" during an unresolved merge), so emptiness
+  # alone does not prove success: check the exit status too.
+  if [ -z "$snap" ] || [ "$stash_rc" -ne 0 ]; then
+    [ -n "$(git -C "$repo" status --porcelain | grep -v '^??')" ] \
+      && warn "could not snapshot uncommitted changes (unresolved merge?); worker sees HEAD only"
+    snap="$head"
+  fi
+  tree="$(git -C "$repo" rev-parse "$snap^{tree}")"
+  if [ ${#with_paths[@]} -gt 0 ]; then
+    local idx p; idx="$(mktemp "${TMPDIR:-/tmp}/farmout-index.XXXXXX")"
+    GIT_INDEX_FILE="$idx" git -C "$repo" read-tree "$tree" || { rm -f "$idx"; die "could not read the snapshot tree"; }
+    for p in "${with_paths[@]}"; do
+      GIT_INDEX_FILE="$idx" git -C "$repo" update-index --add -- "$p" || { rm -f "$idx"; die "could not add --with '$p' to the snapshot"; }
+    done
+    tree="$(GIT_INDEX_FILE="$idx" git -C "$repo" write-tree)"; rm -f "$idx"
+    [ -n "$tree" ] || die "could not write the snapshot tree"
+  fi
+  # A stash commit carries the user's identity and drags an index commit
+  # along; activity scans (git log --all --author=me) would count both as the
+  # user's work. The snapshot is instead one commit on HEAD authored by farmout.
+  if [ "$tree" = "$(git -C "$repo" rev-parse "$head^{tree}")" ]; then
+    snap="$head"
+  else
+    snap="$(GIT_AUTHOR_NAME=farmout GIT_AUTHOR_EMAIL=farmout@localhost \
+      GIT_COMMITTER_NAME=farmout GIT_COMMITTER_EMAIL=farmout@localhost \
+      git -C "$repo" commit-tree "$tree" -p "$head" -m "farmout snapshot" 2>/dev/null)" \
+      || die "could not record the snapshot commit"
+  fi
+  untracked="$(git -C "$repo" ls-files --others --exclude-standard | wc -l | tr -d ' ')"
+
+  local id job wt mode branch
+  id="$(claim_job_id "$cli")" || die "could not claim a job id"
+  job="$(job_dir "$id")"
+  wt="$FARMOUT_HOME/worktrees/$(basename "$repo")-$id"
+
+  if $write; then
+    mode=write; branch="farmout/$cli-${id##*-}"
+  else
+    mode=read; branch=""
+  fi
+
+  local meta_json; meta_json="$(jq -n --arg id "$id" --arg cli "$cli" --arg mode "$mode" \
+    --arg repo "$repo" --arg base "$snap" --arg branch "$branch" --arg wt "$wt" \
+    --arg started "$(now_iso)" --argjson timeout_s "$timeout_s" --argjson untracked "$untracked" \
+    --argjson sup "$$" \
+    --arg kind "$kind" --arg title "$title" --arg model "$model" --arg effort "$effort_final" \
+    --arg route "$route" \
+    --arg source_branch "$source_branch" --arg parent_session "${CLAUDE_CODE_SESSION_ID:-}" \
+    --arg parent_pid "${CLAUDE_PID:-}" \
+    --arg base_ref "$ref" --arg scratch "$scratch" \
+    --argjson out_globs "$(if [ ${#out_globs[@]} -gt 0 ]; then printf '%s\n' "${out_globs[@]}" | jq -R . | jq -cs .; else echo null; fi)" \
+    '{id:$id, cli:$cli, mode:$mode, repo:$repo, base:$base, out_globs:$out_globs,
+      base_ref:(if $base_ref == "" then null else $base_ref end),
+      scratch:(if $scratch == "" then null else $scratch end),
+      branch:(if $branch == "" then null else $branch end), worktree:$wt,
+      pid:null, pgid:null, sup_pid:$sup, admitted:false, started:$started, ended:null, timeout_s:$timeout_s,
+      status:"running", exit_code:null, untracked:$untracked, survivors:0,
+      read_job_modified:false, land:null, error:null,
+      kind:(if $kind == "" then null else $kind end),
+      title:(if $title == "" then null else $title end),
+      model:(if $model == "" then null else $model end),
+      effort:(if $effort == "" then null else $effort end),
+      route:(if $route == "" then null else $route end),
+      source_branch:(if $source_branch == "" then null else $source_branch end),
+      parent_session:(if $parent_session == "" then null else $parent_session end),
+      parent_pid:(if ($parent_pid|test("^[0-9]+$")) then ($parent_pid|tonumber) else null end)}')"
+
+  local max_jobs; max_jobs="$(cfg_limit max_jobs)"; [ -n "$max_jobs" ] || max_jobs="$DEFAULT_MAX_JOBS"
+  if $queue; then admit_queued "$id" "$job" "$max_jobs" "$meta_json"
+  else admit_job "$id" "$job" "$max_jobs" "$meta_json"
+  fi
+
+  # The worktree (and everything else) is created only after admission.
+  mkdir -p "$FARMOUT_HOME/worktrees"
+  # Every brief opens with the isolation rule: the worktree is the boundary
+  # only while the worker stays in it, and a worker handed the wrong repo will
+  # otherwise go and find the right one - the user's live checkout.
+  { printf '%s\n' "$BRIEF_PREAMBLE"; cat "$brief"; } > "$job/brief.md"
+
+  echo "$id"
+  echo "farmout: $id repo=$(basename "$repo") base=$(printf '%.7s' "$snap") mode=$mode${ref:+ ref=$ref}${scratch:+ (scratch)}" >&2
+  # Untracked files matter only when the brief relies on one; a bare count is
+  # the normal state of many repos and trains the reader to ignore it.
+  local u
+  if [ "$untracked" -gt 0 ]; then
+    while IFS= read -r u; do
+      [ -n "$u" ] && grep -qF -- "$u" "$brief" && ! printf '%s\n' ${with_paths[@]+"${with_paths[@]}"} | grep -qxF -- "$u" \
+        && warn "the brief names untracked '$u', which is not in the worker's snapshot (pass it with --with)"
+    done < <(git -C "$repo" ls-files --others --exclude-standard)
+  fi
+
+  # meta.json now exists no matter what happens next (fixes leaked job dirs).
+  if $write; then
+    git -C "$repo" worktree add -q -b "$branch" "$wt" "$snap"
+  else
+    git -C "$repo" worktree add -q --detach "$wt" "$snap"
+  fi || {
+    meta_set "$job" --arg e "$(now_iso)" --arg err "worktree add failed" \
+      '.status = "failed" | .ended = $e | .error = $err'
+    die "worktree add failed"
+  }
+
+  # Share the repo's own cargo target unless the repo already pins one (disk incident, 2026-09).
+  if [ -f "$wt/Cargo.toml" ] && [ -z "${CARGO_TARGET_DIR:-}" ] \
+     && ! grep -qs 'target-dir' "$repo/.cargo/config.toml" "$repo/.cargo/config"; then
+    export CARGO_TARGET_DIR="$repo/target"
+  fi
+
+  # If this supervisor is signalled, it may not just die: the worker is in its
+  # own process group and nothing else would ever reap it or set a final
+  # status. Kill the worker's group and fall through to the normal
+  # finalisation below, which records "killed".
+  local pid=""
+  trap 'touch "$job/kill.requested"; [ -n "$pid" ] && kill_group "$pid"' TERM INT HUP
+
+  ( cd "$wt" && exec perl -e 'setpgrp(0, 0); exec @ARGV' "$SELF" _exec "$cli" "$job" "$wt" "$model" "$effort_final" ) \
+    </dev/null >"$job/log" 2>&1 &
+  pid=$!
+  meta_set "$job" --argjson p "$pid" '.pid = $p | .pgid = $p'
+
+  local start; start="$(date +%s)"
+  while pid_alive "$pid"; do
+    if [ -f "$job/kill.requested" ]; then
+      # The signal may have landed before pid was known, or an external
+      # `farmout kill` may have raced the same window: either way, the
+      # worker itself might still be alive here, and `wait` below must
+      # never block on it.
+      kill_group "$pid"
+      break
+    fi
+    if [ $(( $(date +%s) - start )) -ge "$timeout_s" ]; then
+      touch "$job/timeout.hit"; kill_group "$pid"; break
+    fi
+    sleep 1
+  done
+  wait "$pid"; local code=$?
+
+  # Reap anything the worker left behind in its group.
+  local survivors; survivors="$(group_members "$pid" | wc -l | tr -d ' ')"
+  if [ "$survivors" -gt 0 ]; then
+    kill_group "$pid"
+    [ -n "$(group_members "$pid")" ] && warn "processes in group $pid survived SIGKILL"
+  fi
+
+  adapter_extract "$cli" "$job"
+  local status worker_error=""
+  if [ -f "$job/kill.requested" ]; then status=killed
+  elif [ -f "$job/timeout.hit" ]; then status=timeout
+  elif [ "$code" -ne 0 ]; then
+    if grep -Eiq "$RATE_LIMIT_RE" "$job/log"; then status=rate-limited; else
+      status=failed
+      worker_error="worker exited with code $code"
+      # A second login probe separates "lost its login mid-run" from any other exit.
+      [ "$(adapter_doctor "$cli")" = logged-out ] && worker_error="worker authentication failed: cli '$cli' is logged-out"
+    fi
+  elif grep -q '[^[:space:]]' "$job/result.md"; then status=ok
+  else status=empty
+  fi
+
+  if [ "$mode" = write ]; then
+    # Stage everything first so the patch covers uncommitted changes and any
+    # commit the worker made itself, then diff the index against the
+    # snapshot - independent of whether the best-effort commit below succeeds.
+    # diff-index (plumbing) instead of diff (porcelain): the patch must not
+    # depend on the user's or repo's diff.* config (noprefix, color, etc).
+    if ! git -C "$wt" add -A >/dev/null 2>&1 \
+       || ! git -C "$wt" diff-index --cached -p --binary "$snap" > "$job/diff.patch"; then
+      # Patch capture failing is its own failure, but it must not overwrite a
+      # more specific status (timeout/killed/rate-limited/failed) already set above.
+      case "$status" in ok|empty) status=failed ;; esac
+      meta_set "$job" --arg err "patch capture failed" '.error = $err'
+    fi
+    # Grouped behind a successful cd: if "$wt" cannot be entered, the commit
+    # must never run in whatever directory the supervisor inherited (which
+    # may be the user's own repo).
+    (
+      cd "$wt" && { git diff --cached --quiet || git -c user.name=farmout -c user.email=farmout@localhost \
+        commit -q --no-verify -m "farmout $id"; }
+    ) >/dev/null 2>&1
+  else
+    [ -n "$(meta_get "$job" out_globs)" ] && collect_out "$job" "$wt"
+    local modified=false
+    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ] \
+       || [ "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" != "$snap" ]; then
+      modified=true
+    fi
+    meta_set "$job" --argjson m "$modified" '.read_job_modified = $m'
+    remove_worktree "$job"
+  fi
+
+  meta_set "$job" --arg s "$status" --argjson c "$code" --argjson v "$survivors" --arg e "$(now_iso)" --arg err "$worker_error" \
+    '.status = $s | .exit_code = $c | .survivors = $v | .ended = $e
+     | if .error == null and $err != "" then .error = $err else . end'
+  outcome_append "$(jq -c '{id, cli, kind, mode, model, status, started, ended}' "$job/meta.json")"
+  echo "$id $status"
+  [ "$status" = ok ]
+}
+
+cmd_exec() { # internal: runs inside the new process group
+  adapter_exec "$@"
+}
+
+cmd_status() {
+  if [ -n "${1:-}" ]; then
+    require_job "$1"
+    jq --arg s "$(effective_status "$JOB")" '.status = $s' "$JOB/meta.json"
+    return
+  fi
+  local d
+  local land
+  printf '%-34s %-12s %-8s %-6s %-10s %s\n' JOB STATUS CLI MODE LAND SNAPSHOT-OF
+  for d in "$FARMOUT_HOME"/jobs/*/; do
+    [ -f "$d/meta.json" ] || continue
+    d="${d%/}"
+    land="$(meta_get "$d" land)"
+    printf '%-34s %-12s %-8s %-6s %-10s %s\n' "$(basename "$d")" "$(effective_status "$d")" \
+      "$(meta_get "$d" cli)" "$(meta_get "$d" mode)" "${land:--}" "$(basename "$(meta_get "$d" repo)")"
+  done
+  local t name
+  for t in "$QUEUE_DIR"/*; do
+    [ -f "$t" ] && pid_alive "$(cat "$t" 2>/dev/null)" || continue
+    name="${t##*/}"
+    printf '%-34s %-12s\n' "${name#*-}" queued
+  done
+}
+
+cmd_result() {
+  require_job "$1"
+  if grep -q '[^[:space:]]' "$JOB/result.md" 2>/dev/null; then
+    printf '%s\n' "$(cat "$JOB/result.md")"
+  else
+    # A killed or timed-out job never wrote its final message, but what it
+    # said along the way is in the log - often the findings themselves.
+    local partial; partial="$(adapter_partial "$(meta_get "$JOB" cli)" "$JOB")"
+    [ -n "$partial" ] && printf '%s\n%s\n' "--- partial result (no final message; recovered from the log)" "$partial"
+  fi
+  meta_set "$JOB" '.result_read = true'
+  if [ -d "$JOB/out" ]; then
+    echo "--- out files ($JOB/out)"
+    jq -r '.out[]? // empty' "$JOB/meta.json"
+  fi
+  if [ -s "$JOB/diff.patch" ]; then
+    echo "--- diff.patch ($JOB/diff.patch)"
+    # From outside any repo: inside one, git apply silently skips paths
+    # outside the caller's subdirectory and reports "0 files changed".
+    (cd / && git apply --stat "$JOB/diff.patch")
+  fi
+}
+
+# Copies a read job's --out files to <job>/out/ before its worktree is removed.
+# Untracked copies are then deleted from the worktree so they do not count as
+# the worker modifying files it was told to leave alone.
+collect_out() { # job worktree
+  local job="$1" wt="$2" g f found missing="" copied=""
+  (
+    shopt -s nullglob
+    cd "$wt" || exit 0
+    local root; root="$(pwd -P)"
+    while IFS= read -r g; do
+      found=false
+      for f in $g; do
+        [ -f "$f" ] || continue
+        found=true
+        # Only regular files that really live in the worktree, and not huge:
+        # a symlink (or a symlinked directory) could hand back any file.
+        if [ -L "$f" ] || case "$(cd "$(dirname "$f")" && pwd -P)/" in "$root"/*) false ;; *) true ;; esac; then
+          echo "farmout: warning: --out skipped '$f' (symlink or outside the worktree)" >&2; continue
+        fi
+        if [ "$(wc -c < "$f")" -gt "$OUT_MAX_BYTES" ]; then
+          echo "farmout: warning: --out skipped '$f' (over $OUT_MAX_BYTES bytes)" >&2; continue
+        fi
+        mkdir -p "$job/out/$(dirname "$f")" && cp -p "$f" "$job/out/$f" || continue
+        printf '%s\n' "$f" >> "$job/out.list"
+        git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || rm -f -- "$f"
+      done
+      $found || printf '%s\n' "$g" >> "$job/out.missing"
+    done < <(jq -r '.out_globs[]' "$job/meta.json")
+  )
+  [ -f "$job/out.list" ] && copied="$(jq -R . < "$job/out.list" | jq -cs .)"
+  [ -f "$job/out.missing" ] && missing="$(jq -R . < "$job/out.missing" | jq -cs .)"
+  rm -f "$job/out.list" "$job/out.missing"
+  [ -n "$missing" ] && warn "--out matched nothing: $(jq -r 'join(", ")' <<<"$missing")"
+  meta_set "$job" --argjson o "${copied:-[]}" --argjson m "${missing:-[]}" '.out = $o | .out_missing = $m'
+}
+
+BRIEF_PREAMBLE='# Ground rules (added by farmout)
+- Your working directory is a disposable copy of a repository, made for this job. Work only inside it: do not cd out of it, and do not read or change files elsewhere on this machine unless the brief below names them.
+- If this copy does not match what the brief describes (paths or files missing), stop and report that as your first finding. Do not go looking for the "right" repository.
+'
+
+# Outcome ledger: one JSON line per finished job, plus one per review rating.
+# Lives outside jobs/ so `clean` never erases the history `scores` reads.
+OUTCOMES="$FARMOUT_HOME/outcomes.jsonl"
+outcome_append() { # json-line
+  [ -n "$1" ] && printf '%s\n' "$1" >> "$OUTCOMES"
+}
+
+# Claude's review verdict: how many of the job's claims held up when checked.
+cmd_rate() {
+  require_job "$1"
+  local ratio="${2:-}" note="${3:-}" v n
+  case "$ratio" in
+    */*) v="${ratio%%/*}"; n="${ratio#*/}" ;;
+    *) die "usage: farmout rate <job> <verified>/<total> [note]" ;;
+  esac
+  case "$v$n" in ''|*[!0-9]*) die "rate: '$ratio' is not <verified>/<total>" ;; esac
+  v=$((10#$v)); n=$((10#$n))
+  [ "$n" -ge 1 ] && [ "$v" -le "$n" ] || die "rate: need 0 <= verified <= total, total >= 1"
+  meta_set "$JOB" --argjson v "$v" --argjson n "$n" --arg note "$note" --arg at "$(now_iso)" \
+    '.review = {verified: $v, total: $n, note: $note, at: $at}'
+  outcome_append "$(jq -c '{id, cli, kind, review}' "$JOB/meta.json")"
+  echo "$(basename "$JOB") rated $v/$n"
+}
+
+# Per cli and kind: jobs, ok, verified/total claims. Latest line per job wins.
+cmd_scores() {
+  [ -s "$OUTCOMES" ] || { echo "no finished jobs recorded yet"; return 0; }
+  jq -rs '
+    (map(select(.status)) | group_by(.id) | map(last)) as $runs
+    | (map(select(.review)) | group_by(.id) | map(last)) as $reviews
+    | ($runs | map({key: .id, value: .}) | from_entries) as $byid
+    | [ $runs[] | {cli, kind: (.kind // "-"), ok: (.status == "ok"), v: 0, n: 0} ]
+      + [ $reviews[] | {cli: ($byid[.id].cli // .cli), kind: ($byid[.id].kind // .kind // "-"),
+                        ok: null, v: .review.verified, n: .review.total} ]
+    | group_by([.cli, .kind])
+    | (["CLI", "KIND", "JOBS", "OK", "CLAIMS HELD"] | @tsv),
+      (.[] | [ .[0].cli, .[0].kind,
+               (map(select(.ok != null)) | length),
+               (map(select(.ok == true)) | length),
+               ((map(.n) | add) as $n | if $n > 0 then "\(map(.v) | add)/\($n)" else "-" end)
+             ] | @tsv)
+  ' "$OUTCOMES" | column -t -s "$(printf '\t')"
+}
+
+# Semantic progress of a job: {"events": N, "open_tools": K} or {"unknown": why}.
+# Same definition the dashboard uses (arcade/progress.py). The caller owns the
+# clock: stalled = events unchanged for stall_min with open_tools == 0.
+cmd_progress() {
+  require_job "$1"
+  "${FARMOUT_PYTHON:-$(command -v python3 || echo /usr/bin/python3)}" "$FARMOUT_ROOT/arcade/progress.py" \
+    "$(jq -r .cli "$JOB/meta.json")" "$JOB/log"
+}
+
+cmd_kill() {
+  require_job "$1"
+  local es; es="$(effective_status "$JOB")"
+  case "$es" in
+    running|lost) ;;
+    *) die "job $1 is not running" ;;
+  esac
+  touch "$JOB/kill.requested"
+  local pgid; pgid="$(meta_get "$JOB" pgid)"
+  kill_group "$pgid"
+  # A lost job has no supervisor left to finalise it after the kill.
+  [ "$es" = lost ] && meta_set "$JOB" --arg e "$(now_iso)" '.status = "killed" | .ended = $e'
+  if [ -n "$(group_members "$pgid")" ]; then
+    warn "processes in group $pgid survived kill"
+    exit 1
+  fi
+  echo "$1 kill requested"
+}
+
+cmd_land() {
+  require_job "$1"
+  [ "$(meta_get "$JOB" mode)" = write ] || die "job $1 is read-only; nothing to land"
+  [ "$(effective_status "$JOB")" = ok ] || die "job $1 status is $(effective_status "$JOB"); only ok jobs land"
+  [ -z "$(meta_get "$JOB" land)" ] || die "job $1 already $(meta_get "$JOB" land)"
+  local repo; repo="$(meta_get "$JOB" repo)"
+  # A --ref job was cut from a pinned commit, not from what is checked out;
+  # the patch still lands on the checkout, so say when that is another line.
+  local base_ref; base_ref="$(meta_get "$JOB" base_ref)"
+  if [ -n "$base_ref" ] && ! git -C "$repo" merge-base --is-ancestor "$(meta_get "$JOB" base)" HEAD 2>/dev/null; then
+    warn "job $1 was cut from $base_ref, which your checkout ($(git -C "$repo" symbolic-ref --short -q HEAD || git -C "$repo" rev-parse --short HEAD)) does not contain; landing onto it anyway"
+  fi
+  if [ -s "$JOB/diff.patch" ] && ! git -C "$repo" apply --whitespace=nowarn "$JOB/diff.patch"; then
+    meta_set "$JOB" '.land = "conflict"'
+    echo "farmout: $1 no longer applies cleanly; checkout untouched, worktree kept" >&2
+    exit 3
+  fi
+  remove_worktree "$JOB"
+  meta_set "$JOB" '.land = "landed"'
+  echo "$1 landed as uncommitted changes"
+}
+
+cmd_discard() {
+  require_job "$1"
+  local es; es="$(effective_status "$JOB")"
+  [ "$es" != running ] || die "job $1 is running; kill it first"
+  [ "$(meta_get "$JOB" land)" != landed ] || die "job $1 already landed"
+  # Only a lost job's group is ours to reap: any other status means the
+  # supervisor already emptied it, and the stored pgid may since have been
+  # recycled by an unrelated process (macOS pids wrap).
+  [ "$es" = lost ] && kill_group "$(meta_get "$JOB" pgid)"
+  remove_worktree "$JOB"
+  meta_set "$JOB" '.land = "discarded"'
+  echo "$1 discarded (the result and log stay in $JOB until clean). It said:"
+  { grep -q '[^[:space:]]' "$JOB/result.md" 2>/dev/null && cat "$JOB/result.md" || adapter_partial "$(meta_get "$JOB" cli)" "$JOB"; } | head -5 | sed 's/^/  /'
+}
+
+cmd_clean() {
+  local all=false mine=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) all=true ;;
+      # Only jobs launched from this Claude session; other sessions' records stay.
+      --mine) mine="${CLAUDE_CODE_SESSION_ID:-}"
+              [ -n "$mine" ] || die "--mine needs CLAUDE_CODE_SESSION_ID (run it from a Claude Code session)" ;;
+      *) usage ;;
+    esac
+    shift
+  done
+  local d n=0 es mode land
+  for d in "$FARMOUT_HOME"/jobs/*/; do
+    [ -f "$d/meta.json" ] || continue
+    d="${d%/}"
+    [ -z "$mine" ] || [ "$(meta_get "$d" parent_session)" = "$mine" ] || continue
+    es="$(effective_status "$d")"
+    [ "$es" = running ] && continue
+    mode="$(meta_get "$d" mode)"; land="$(meta_get "$d" land)"
+    # A write job that is ok and never landed (or lost the race to land)
+    # holds unreviewed work; keep it unless --all says otherwise.
+    if ! $all && [ "$mode" = write ] && [ "$es" = ok ] \
+       && { [ -z "$land" ] || [ "$land" = conflict ]; }; then
+      echo "kept $(basename "$d") (unlanded write job; use --all)"
+      continue
+    fi
+    if ! $all && [ "$(meta_get "$d" result_read)" != true ] && [ "$es" != lost ] \
+       && { grep -q '[^[:space:]]' "$d/result.md" 2>/dev/null || [ -n "$(adapter_partial "$(meta_get "$d" cli)" "$d")" ]; }; then
+      echo "kept $(basename "$d") (result never read: farmout result $(basename "$d"); or use --all)"
+      continue
+    fi
+    [ "$es" = lost ] && kill_group "$(meta_get "$d" pgid)"
+    remove_worktree "$d"
+    rm -rf "$d"; n=$((n + 1))
+  done
+  echo "removed $n job(s)"
+}
+
+cmd_doctor() {
+  local json=false
+  case "${1:-}" in
+    --json) json=true ;;
+    "") ;;
+    *) usage ;;
+  esac
+  local cli bin ver rows="" row
+  for cli in $ADAPTERS; do
+    [ "$cli" = fake ] && continue
+    bin="$(adapter_bin "$cli")"
+    ver="$("$bin" --version </dev/null 2>/dev/null | head -1)"
+    if $json; then
+      row="$(jq -n --arg c "$cli" --arg s "$(adapter_doctor "$cli")" --arg v "$ver" \
+        '{cli:$c, status:$s, version:(if $v == "" then null else $v end)}')"
+      rows="${rows:+$rows,}$row"
+    else
+      printf '%-8s %-13s %s\n' "$cli" "$(adapter_doctor "$cli")" "${ver:--}"
+    fi
+  done
+  $json && echo "[$rows]"
+  return 0
+}
+
+# FARMOUT_PYTHON is a test-only seam for stubbing the python3 binary.
+cmd_arcade() {
+  exec "${FARMOUT_PYTHON:-$(command -v python3 || echo /usr/bin/python3)}" "$FARMOUT_ROOT/arcade/server.py" "$@"
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  run) cmd_run "$@" ;;
+  _exec) cmd_exec "$@" ;;
+  status) cmd_status "$@" ;;
+  result) cmd_result "$@" ;;
+  progress) cmd_progress "$@" ;;
+  rate) cmd_rate "$@" ;;
+  scores) cmd_scores "$@" ;;
+  kill) cmd_kill "$@" ;;
+  land) cmd_land "$@" ;;
+  discard) cmd_discard "$@" ;;
+  clean) cmd_clean "$@" ;;
+  doctor) cmd_doctor "$@" ;;
+  arcade) cmd_arcade "$@" ;;
+  version|--version|-v) cat "$FARMOUT_ROOT/VERSION" ;;
+  help|--help|-h) usage_text ;;
+  *) usage ;;
+esac

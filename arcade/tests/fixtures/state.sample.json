@@ -1,0 +1,593 @@
+{
+  "now": 1790167372531,
+  "stall_min": 10,
+  "machine": "work",
+  "errors": [
+    "kiro log: 1 unparsable line in 20260923-140010-kiro-c3d4"
+  ],
+  "hud": {
+    "score": 1234567,
+    "live": 8,
+    "shown": 10,
+    "credits": 0.19,
+    "premium": 3
+  },
+  "sessions": [
+    {
+      "id": "441806dd-c9c9-48e5-9f11-2d84fe27649b",
+      "name": "notes-app-0e",
+      "repo": "notes-app",
+      "branch": "main",
+      "cwd": "/Users/me/Projects/notes-app",
+      "model": "claude-opus-5-5",
+      "status": "turn",
+      "title": "Offline sync: move conflict handling into the merge step",
+      "prompt": "Ship the merge review to Codex and have Cursor build the last-write-wins strategy.",
+      "tool": null,
+      "started": 1790164612531,
+      "elapsed_s": 2760,
+      "tokens": {
+        "in": 412300,
+        "out": 38900,
+        "cache": 1880400
+      },
+      "score": 451200,
+      "replay": [
+        {
+          "t": 1790165872531,
+          "m": "Bash npm test"
+        },
+        {
+          "t": 1790167252531,
+          "m": "Read job result"
+        }
+      ],
+      "files": [
+        {
+          "n": "src/sync/merge.ts",
+          "a": 48,
+          "d": 12
+        },
+        {
+          "n": "docs/sync.md",
+          "a": 9,
+          "d": null
+        }
+      ],
+      "crew": [
+        "20260923-141502-codex-a1b2",
+        "20260923-130500-cursor-0a1b"
+      ]
+    },
+    {
+      "id": "7a1e0c2b-51f0-4d0e-9c3a-2f6f8e0d9b11",
+      "name": "kcm-7811",
+      "repo": "payments-api",
+      "branch": "feature/PAY-142",
+      "cwd": "/Users/me/Projects/payments-api",
+      "model": "claude-sonnet-4-5",
+      "status": "play",
+      "title": "PAY-142: tenant CSV export endpoint",
+      "prompt": "Add the CSV export behind the matrix feature flag.",
+      "tool": "Edit",
+      "started": 1790165452531,
+      "elapsed_s": 1920,
+      "tokens": {
+        "in": 228100,
+        "out": 21450,
+        "cache": 960200
+      },
+      "score": 249550,
+      "replay": [
+        {
+          "t": 1790167312531,
+          "m": "Edit src/export/csv.ts"
+        }
+      ],
+      "files": [
+        {
+          "n": "src/export/csv.ts",
+          "a": 88,
+          "d": 0
+        }
+      ],
+      "crew": [
+        "20260923-140010-kiro-c3d4",
+        "20260923-133000-copilot-e5f6",
+        "20260923-124000-codex-2c3d"
+      ]
+    },
+    {
+      "id": "c03f5a90-0f0e-4b8c-8e2d-1b7c6a5d4e33",
+      "name": "notes-app-9f",
+      "repo": "notes-app",
+      "branch": "arcade/ui",
+      "cwd": "/Users/me/Projects/notes-app",
+      "model": "claude-opus-5-5",
+      "status": "think",
+      "title": "Port the arcade console",
+      "prompt": "Port the design to Preact.",
+      "tool": null,
+      "started": 1790166652531,
+      "elapsed_s": 720,
+      "tokens": {
+        "in": 90000,
+        "out": 12000,
+        "cache": 400000
+      },
+      "score": 102000,
+      "replay": [
+        {
+          "t": 1790167367531,
+          "m": "Read console.html"
+        }
+      ],
+      "files": [],
+      "crew": []
+    },
+    {
+      "id": "e9b2d6f1-3a4c-4e5f-8a7b-9c0d1e2f3a44",
+      "name": "dotfiles-1",
+      "repo": "dotfiles",
+      "branch": "main",
+      "cwd": "/Users/me/Projects/dotfiles",
+      "model": null,
+      "status": "idle",
+      "title": "Speed up zsh startup",
+      "prompt": "Profile my zsh startup.",
+      "tool": null,
+      "started": 1790163472531,
+      "elapsed_s": 3900,
+      "tokens": {
+        "in": 40210,
+        "out": 6100,
+        "cache": 88000
+      },
+      "score": 46310,
+      "replay": [
+        {
+          "t": 1790164972531,
+          "m": "Edit .zshrc"
+        }
+      ],
+      "files": [
+        {
+          "n": ".zshrc",
+          "a": 6,
+          "d": 14
+        }
+      ],
+      "crew": []
+    },
+    {
+      "id": "5d4c3b2a-1f0e-4d9c-8b7a-6f5e4d3c2b55",
+      "name": "infra-2",
+      "repo": "infra",
+      "branch": "main",
+      "cwd": "/Users/me/Projects/infra",
+      "model": "claude-opus-5-5",
+      "status": "SHELL",
+      "title": "infra-2",
+      "prompt": null,
+      "tool": null,
+      "started": 1790167072531,
+      "elapsed_s": 300,
+      "tokens": null,
+      "score": null,
+      "replay": [],
+      "files": [],
+      "crew": []
+    }
+  ],
+  "jobs": [
+    {
+      "id": "20260923-141502-codex-a1b2",
+      "cli": "codex",
+      "kind": "review",
+      "mode": "read",
+      "title": "Review merge.ts conflict handling for data-loss paths",
+      "brief": "Review merge.ts conflict handling for data-loss paths. Report findings with file and line; do not change files unless this is a write job.",
+      "repo": "notes-app",
+      "branch": "main",
+      "model": "gpt-5-codex",
+      "effort": "high",
+      "status": "running",
+      "pose": "play",
+      "land": null,
+      "error": null,
+      "elapsed_s": 760,
+      "timeout_s": 1800,
+      "started": 1790166612531,
+      "ended": null,
+      "tool": "Read",
+      "tokens": 184220,
+      "coins": null,
+      "replay": [
+        {
+          "t": null,
+          "m": "Bash find . -type f"
+        },
+        {
+          "t": null,
+          "m": "Read src/sync/merge.ts"
+        },
+        {
+          "t": null,
+          "m": "Grep applyRemote"
+        }
+      ],
+      "files": null,
+      "worktree": null,
+      "parent_session": "441806dd-c9c9-48e5-9f11-2d84fe27649b",
+      "route": "prefer codex",
+      "out": []
+    },
+    {
+      "id": "20260923-140010-kiro-c3d4",
+      "cli": "kiro",
+      "kind": "bulk-read",
+      "mode": "read",
+      "title": "List every tenant field name used by the legacy mappers",
+      "brief": "List every tenant field name used by the legacy mappers. Report findings with file and line; do not change files unless this is a write job.",
+      "repo": "payments-api",
+      "branch": "feature/PAY-142",
+      "model": null,
+      "effort": null,
+      "status": "running",
+      "pose": "pause",
+      "land": null,
+      "error": null,
+      "elapsed_s": 1510,
+      "timeout_s": 2700,
+      "started": 1790165862531,
+      "ended": null,
+      "tool": "Grep",
+      "tokens": null,
+      "coins": {
+        "value": 0.07,
+        "unit": "CR"
+      },
+      "replay": [
+        {
+          "t": null,
+          "m": "Grep tenant\\."
+        },
+        {
+          "t": null,
+          "m": "Read src/legacy/mappers/contacts.js"
+        }
+      ],
+      "files": null,
+      "worktree": null,
+      "parent_session": "7a1e0c2b-51f0-4d0e-9c3a-2f6f8e0d9b11",
+      "route": "prefer kiro",
+      "out": []
+    },
+    {
+      "id": "20260923-133000-copilot-e5f6",
+      "cli": "copilot",
+      "kind": "second-opinion",
+      "mode": "read",
+      "title": "Second opinion on the CSV streaming approach",
+      "brief": "Second opinion on the CSV streaming approach. Report findings with file and line; do not change files unless this is a write job.",
+      "repo": "payments-api",
+      "branch": "feature/PAY-142",
+      "model": "gpt-5",
+      "effort": null,
+      "status": "lost",
+      "pose": "lost",
+      "land": null,
+      "error": null,
+      "elapsed_s": 2200,
+      "timeout_s": 1800,
+      "started": 1790165172531,
+      "ended": null,
+      "tool": "Read",
+      "tokens": null,
+      "coins": {
+        "value": 2,
+        "unit": "PR"
+      },
+      "replay": [
+        {
+          "t": 1790165572531,
+          "m": "Read src/export/csv.ts"
+        }
+      ],
+      "files": null,
+      "worktree": null,
+      "parent_session": "7a1e0c2b-51f0-4d0e-9c3a-2f6f8e0d9b11",
+      "route": null,
+      "out": []
+    },
+    {
+      "id": "20260923-130500-cursor-0a1b",
+      "cli": "cursor",
+      "kind": "implement",
+      "mode": "write",
+      "title": "Add last-write-wins strategy to the merge step",
+      "brief": "Add last-write-wins strategy to the merge step. Report findings with file and line; do not change files unless this is a write job.",
+      "repo": "notes-app",
+      "branch": "main",
+      "model": "composer-1",
+      "effort": null,
+      "status": "ok",
+      "pose": "ready",
+      "land": null,
+      "error": null,
+      "elapsed_s": 1122,
+      "timeout_s": 2700,
+      "started": 1790165050531,
+      "ended": 1790166172531,
+      "tool": null,
+      "tokens": 96410,
+      "coins": null,
+      "replay": [
+        {
+          "t": 1790165872531,
+          "m": "Edit src/sync/merge.ts"
+        },
+        {
+          "t": 1790166112531,
+          "m": "Bash npm test -- strategies"
+        }
+      ],
+      "files": [
+        {
+          "n": "src/sync/merge.ts",
+          "a": 34,
+          "d": 18
+        },
+        {
+          "n": "src/sync/strategies/lastWriteWins.ts",
+          "a": 52,
+          "d": 0
+        },
+        {
+          "n": "test/sync/strategies.test.ts",
+          "a": 40,
+          "d": 2
+        }
+      ],
+      "worktree": "/Users/me/.cache/farmout/worktrees/20260923-130500-cursor-0a1b",
+      "parent_session": "441806dd-c9c9-48e5-9f11-2d84fe27649b",
+      "route": "prefer cursor",
+      "out": []
+    },
+    {
+      "id": "20260923-124000-codex-2c3d",
+      "cli": "codex",
+      "kind": "implement",
+      "mode": "write",
+      "title": "Rename matrixRow to tenantRow across services",
+      "brief": "Rename matrixRow to tenantRow across services. Report findings with file and line; do not change files unless this is a write job.",
+      "repo": "payments-api",
+      "branch": "feature/PAY-142",
+      "model": null,
+      "effort": null,
+      "status": "ok",
+      "pose": "conflict",
+      "land": "conflict",
+      "error": null,
+      "elapsed_s": 665,
+      "timeout_s": 1800,
+      "started": 1790164307531,
+      "ended": 1790164972531,
+      "tool": null,
+      "tokens": 51200,
+      "coins": null,
+      "replay": [
+        {
+          "t": null,
+          "m": "Edit src/matrix/row.ts"
+        }
+      ],
+      "files": [
+        {
+          "n": "src/matrix/row.ts",
+          "a": 31,
+          "d": 9
+        }
+      ],
+      "worktree": "/Users/me/.cache/farmout/worktrees/20260923-124000-codex-2c3d",
+      "parent_session": "7a1e0c2b-51f0-4d0e-9c3a-2f6f8e0d9b11",
+      "route": null,
+      "out": []
+    }
+  ],
+  "hof": [
+    {
+      "id": "20260923-120000-copilot-4e5f",
+      "cli": "copilot",
+      "kind": "review",
+      "mode": "read",
+      "title": "Review migration 0042 for table locks",
+      "brief": "Review migration 0042 for table locks. Report findings with file and line; do not change files unless this is a write job.",
+      "repo": "notes-app",
+      "branch": "main",
+      "model": null,
+      "effort": null,
+      "status": "timeout",
+      "pose": "over",
+      "land": null,
+      "error": "timed out after 20:00",
+      "elapsed_s": 1200,
+      "timeout_s": 1200,
+      "started": 1790163172531,
+      "ended": 1790164372531,
+      "tool": null,
+      "tokens": null,
+      "coins": {
+        "value": 1,
+        "unit": "PR"
+      },
+      "replay": [
+        {
+          "t": 1790163772531,
+          "m": "Read migrations/0042.sql"
+        }
+      ],
+      "files": null,
+      "worktree": null,
+      "parent_session": null,
+      "route": null,
+      "out": []
+    },
+    {
+      "id": "20260923-110000-cursor-6a7b",
+      "cli": "cursor",
+      "kind": "implement",
+      "mode": "write",
+      "title": "Extract frontmatter parser into its own module",
+      "brief": "Extract frontmatter parser into its own module. Report findings with file and line; do not change files unless this is a write job.",
+      "repo": "notes-app",
+      "branch": "main",
+      "model": null,
+      "effort": null,
+      "status": "ok",
+      "pose": "landed",
+      "land": "landed",
+      "error": null,
+      "elapsed_s": 1102,
+      "timeout_s": 1800,
+      "started": 1790162070531,
+      "ended": 1790163172531,
+      "tool": null,
+      "tokens": 88000,
+      "coins": null,
+      "replay": [
+        {
+          "t": null,
+          "m": "Write src/frontmatter.ts"
+        }
+      ],
+      "files": [
+        {
+          "n": "src/frontmatter.ts",
+          "a": 31,
+          "d": 9
+        },
+        {
+          "n": "test/frontmatter.test.ts",
+          "a": 22,
+          "d": 0
+        }
+      ],
+      "worktree": "/Users/me/.cache/farmout/worktrees/20260923-110000-cursor-6a7b",
+      "parent_session": null,
+      "route": null,
+      "out": []
+    },
+    {
+      "id": "20260923-103000-codex-8c9d",
+      "cli": "codex",
+      "kind": "implement",
+      "mode": "write",
+      "title": "Prototype file watcher debounce",
+      "brief": "Prototype file watcher debounce. Report findings with file and line; do not change files unless this is a write job.",
+      "repo": "notes-app",
+      "branch": "main",
+      "model": null,
+      "effort": null,
+      "status": "ok",
+      "pose": "discarded",
+      "land": "discarded",
+      "error": null,
+      "elapsed_s": 595,
+      "timeout_s": 1800,
+      "started": 1790161377531,
+      "ended": 1790161972531,
+      "tool": null,
+      "tokens": 41000,
+      "coins": null,
+      "replay": [
+        {
+          "t": null,
+          "m": "Edit src/watch.ts"
+        }
+      ],
+      "files": [
+        {
+          "n": "src/watch.ts",
+          "a": 12,
+          "d": 3
+        }
+      ],
+      "worktree": "/Users/me/.cache/farmout/worktrees/20260923-103000-codex-8c9d",
+      "parent_session": null,
+      "route": null,
+      "out": []
+    },
+    {
+      "id": "20260923-100000-kiro-0e1f",
+      "cli": "kiro",
+      "kind": "research",
+      "mode": "read",
+      "title": "Survey CRDT libraries for offline sync",
+      "brief": "Survey CRDT libraries for offline sync. Report findings with file and line; do not change files unless this is a write job.",
+      "repo": "notes-app",
+      "branch": "main",
+      "model": null,
+      "effort": null,
+      "status": "ok",
+      "pose": "clear",
+      "land": null,
+      "error": null,
+      "elapsed_s": 1480,
+      "timeout_s": 1800,
+      "started": 1790159292531,
+      "ended": 1790160772531,
+      "tool": null,
+      "tokens": null,
+      "coins": {
+        "value": 0.12,
+        "unit": "CR"
+      },
+      "replay": [
+        {
+          "t": null,
+          "m": "Web automerge.org/docs"
+        }
+      ],
+      "files": null,
+      "worktree": null,
+      "parent_session": null,
+      "route": null,
+      "out": []
+    },
+    {
+      "id": "20260923-093000-codex-2a3b",
+      "cli": "codex",
+      "kind": "review",
+      "mode": "read",
+      "title": "Review auth scopes for the export endpoint",
+      "brief": "Review auth scopes for the export endpoint. Report findings with file and line; do not change files unless this is a write job.",
+      "repo": "payments-api",
+      "branch": "feature/PAY-142",
+      "model": null,
+      "effort": null,
+      "status": "rate-limited",
+      "pose": "over",
+      "land": null,
+      "error": "429 rate limit reached",
+      "elapsed_s": 192,
+      "timeout_s": 1800,
+      "started": 1790158780531,
+      "ended": 1790158972531,
+      "tool": null,
+      "tokens": null,
+      "coins": null,
+      "replay": [
+        {
+          "t": null,
+          "m": "Read src/auth/scopes.ts"
+        }
+      ],
+      "files": null,
+      "worktree": null,
+      "parent_session": null,
+      "route": null,
+      "out": []
+    }
+  ]
+}

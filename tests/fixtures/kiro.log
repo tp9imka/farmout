@@ -1,0 +1,7 @@
+{"type":"runStarted","data":{"payloadSchema":"acp","acpProtocolVersion":1,"engine":"v2"}}
+{"type":"metadata","data":{"sessionId":"00000000-0000-4000-8000-000000000000","contextUsagePercentage":34.8120002746582}}
+{"type":"sessionUpdate","data":{"sessionId":"00000000-0000-4000-8000-000000000000","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"LINE1"}}}}
+{"type":"sessionUpdate","data":{"sessionId":"00000000-0000-4000-8000-000000000000","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"\nLINE2"}}}}
+{"type":"metadata","data":{"sessionId":"00000000-0000-4000-8000-000000000000","contextUsagePercentage":2.2885000705718994}}
+{"type":"metadata","data":{"sessionId":"00000000-0000-4000-8000-000000000000","contextUsagePercentage":2.2885000705718994,"meteringUsage":[{"value":0.07328924825870649,"unit":"credit","unitPlural":"credits"}],"turnDurationMs":2894}}
+{"type":"runFinished","data":{"sessionId":"00000000-0000-4000-8000-000000000000","status":"success","stopReason":"end_turn","finalText":"LINE1\nLINE2","finalTextTruncated":false}}

@@ -1,0 +1,5 @@
+{"type":"user.message","data":{"content":"Reply with exactly the word PONG"}}
+{"type":"assistant.message","data":{"content":"","toolRequests":[{"name":"view"}]}}
+{"type":"assistant.message","data":{"content":"PONG","toolRequests":[]}}
+{"type":"assistant.turn_end","data":{"turnId":"0"}}
+{"type":"result","exitCode":0}

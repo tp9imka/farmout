@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Test double for the `farmout` binary, driven entirely by env vars.
+
+- FAKE_FARMOUT_LOG: path to append one JSON line per invocation ({"argv": [...]}).
+- FAKE_FARMOUT_<VERB>_EXIT: exit code for that verb (default 0).
+- FAKE_FARMOUT_STDOUT / FAKE_FARMOUT_STDERR: text to print for kill/land/discard.
+- FAKE_FARMOUT_DOCTOR_JSON: stdout for `doctor --json` (default "[]").
+- FAKE_FARMOUT_SLEEP: seconds to sleep before responding (for concurrency tests).
+- FAKE_FARMOUT_GRANDCHILD_PIDFILE: spawns a real `sleep 60` grandchild and
+  writes its pid to this path before sleeping, so a timeout test can check
+  whether the grandchild died along with this process (process-group kill).
+- FAKE_FARMOUT_DETACHED_GRANDCHILD_PIDFILE: same, but the grandchild gets
+  its own session (start_new_session), so a killpg of *this* process's
+  group does not reach it -- while it still inherits this process's
+  stdout/stderr (the server's pipes), simulating a detached descendant
+  that would otherwise hang the post-kill communicate() forever.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+
+
+def main():
+    argv = sys.argv[1:]
+
+    log_path = os.environ.get("FAKE_FARMOUT_LOG")
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"argv": argv}) + "\n")
+
+    pidfile = os.environ.get("FAKE_FARMOUT_GRANDCHILD_PIDFILE")
+    if pidfile:
+        grandchild = subprocess.Popen(["sleep", "60"])
+        with open(pidfile, "w", encoding="utf-8") as f:
+            f.write(str(grandchild.pid))
+
+    detached_pidfile = os.environ.get("FAKE_FARMOUT_DETACHED_GRANDCHILD_PIDFILE")
+    if detached_pidfile:
+        detached = subprocess.Popen(["sleep", "8"], start_new_session=True)
+        with open(detached_pidfile, "w", encoding="utf-8") as f:
+            f.write(str(detached.pid))
+
+    sleep_s = os.environ.get("FAKE_FARMOUT_SLEEP")
+    if sleep_s:
+        time.sleep(float(sleep_s))
+
+    verb = argv[0] if argv else ""
+
+    if verb == "doctor":
+        sys.stdout.write(os.environ.get("FAKE_FARMOUT_DOCTOR_JSON", "[]"))
+        return 0
+
+    code = int(os.environ.get("FAKE_FARMOUT_{}_EXIT".format(verb.upper()), "0"))
+    out = os.environ.get("FAKE_FARMOUT_STDOUT", "")
+    err = os.environ.get("FAKE_FARMOUT_STDERR", "")
+    if out:
+        sys.stdout.write(out)
+    if err:
+        sys.stderr.write(err)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

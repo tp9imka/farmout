@@ -1,0 +1,4 @@
+{"type":"runStarted","data":{"payloadSchema":"acp","acpProtocolVersion":1,"engine":"v2"}}
+{"type":"sessionUpdate","data":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"LINE1"}}}}
+{"type":"sessionUpdate","data":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"\nLINE2"}}}}
+{"type":"runFinished","data":{"sessionId":"s","status":"success","stopReason":"end_turn","finalText":"LINE1","finalTextTruncated":true}}

@@ -1,0 +1,11 @@
+{
+  "name": "farmout",
+  "owner": { "name": "tp9imka" },
+  "plugins": [
+    {
+      "name": "farmout",
+      "source": "./",
+      "description": "Farm out work from Claude Code to Codex, Kiro, Copilot and Cursor, then review and land it."
+    }
+  ]
+}

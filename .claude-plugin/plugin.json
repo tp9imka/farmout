@@ -1,0 +1,10 @@
+{
+  "name": "farmout",
+  "version": "1.0.0",
+  "description": "Farm out work from Claude Code to your other coding-agent CLIs (Codex, Kiro, Copilot, Cursor): isolated worktrees, stall detection, a review-then-land flow, and a retro arcade dashboard.",
+  "author": { "name": "tp9imka" },
+  "homepage": "https://github.com/tp9imka/farmout",
+  "repository": "https://github.com/tp9imka/farmout",
+  "license": "MIT",
+  "keywords": ["delegation", "codex", "kiro", "copilot", "cursor", "worktree", "code-review", "multi-agent"]
+}

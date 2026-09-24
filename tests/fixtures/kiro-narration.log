@@ -1,0 +1,7 @@
+Opening browser... | Press (^) + C to cancel{"type":"runStarted","data":{}}
+{"type":"sessionUpdate","data":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"I'll start by exploring the repo."}}}}
+{"type":"sessionUpdate","data":{"update":{"sessionUpdate":"tool_call","toolCallId":"t1","kind":"read","title":"Reading a.txt"}}}
+{"type":"sessionUpdate","data":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"}}}
+{"type":"sessionUpdate","data":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Final "}}}}
+{"type":"sessionUpdate","data":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answer."}}}}
+{"type":"runFinished","data":{"finalText":"I'll start by exploring the repo.Final answer.","finalTextTruncated":false}}
