@@ -50,12 +50,13 @@ const tokensOf = (rec, kind) => kind === 'claude' ? rec.score : rec.tokens;
 export function stageOf(kind, rec) {
   if (kind === 'claude') return SESSION_STAGES.includes(rec.status) ? rec.status : 'raw';
   const p = rec.pose;
-  if (p === 'play' || p === 'pause' || p === 'lost' || p === 'over') return p;
+  if (p === 'play' || p === 'pause' || p === 'lost' || p === 'over' || p === 'queued') return p;
   return 'clear';
 }
 
 export function spritePose(kind, rec) {
   if (kind === 'claude') { const st = stageOf(kind, rec); return st === 'raw' ? 'idle' : st; }
+  if (rec.pose === 'queued') return 'idle';
   return rec.pose === 'ready' || rec.pose === 'landed' ? 'clear' : rec.pose;
 }
 
@@ -73,6 +74,7 @@ export function tagFor(kind, rec, blink) {
   if (st === 'play') return T('PLAY', C.R, C.W, C.R);
   if (st === 'pause') return T('PAUSE', C.AMB, C.INK, C.AMB, true);
   if (st === 'lost') return T('LOST', 'transparent', C.G4, C.G4, false, 'dashed');
+  if (st === 'queued') return T('QUEUED', 'transparent', C.AMB, C.AMB, true, 'dashed');
   if (st === 'over') return T('OVER · ' + overReason(rec), 'transparent', C.R, C.R);
   return {
     ready: T('READY TO LAND', C.W, C.INK, C.W, true), landed: T('LANDED', C.W, C.INK, C.W),
@@ -154,7 +156,7 @@ export function focusJobVM(rec, f, blink) {
   o.canLand = rec.pose === 'ready';
   o.canDiscard = rec.pose === 'ready' || rec.pose === 'conflict';
   o.noActions = !o.canKill && !o.canLand && !o.canDiscard;
-  o.actionNote = st === 'over' ? 'JOB ENDED · NO ACTIONS' : rec.pose === 'landed' ? 'PATCH LANDED · NO ACTIONS'
+  o.actionNote = st === 'queued' ? 'QUEUED · WAITING FOR A SLOT' : st === 'over' ? 'JOB ENDED · NO ACTIONS' : rec.pose === 'landed' ? 'PATCH LANDED · NO ACTIONS'
     : rec.pose === 'discarded' ? 'WORKTREE DISCARDED · NO ACTIONS' : 'READ JOB · NOTHING TO LAND';
   o.showConflict = rec.pose === 'conflict';
   o.showLanded = rec.pose === 'landed';

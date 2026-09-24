@@ -214,6 +214,7 @@ class JobsModel(object):
             live_ids.add(name)
             records.append(self._build_record(job_dir, meta, now_ms, stall_min, errors))
 
+        records.extend(self._queued_records(live_ids, now_ms, stall_min, errors))
         self._prune(live_ids)
 
         jobs = [r for r in records if self._in_jobs(r)]
@@ -223,6 +224,31 @@ class JobsModel(object):
         today = self._today_totals(records, now_ms)
 
         return {"jobs": jobs, "hof": hof, "errors": errors, "today": today}
+
+    def _queued_records(self, live_ids, now_ms, stall_min, errors):
+        """Waiters from `farmout run --queue`: a ticket per job (line 1 the
+        waiter's pid, then its meta). They have no job dir until admitted."""
+        root = os.path.join(self.farmout_home, "queue")
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            return []
+        out = []
+        for name in names:
+            try:
+                with open(os.path.join(root, name), "r", encoding="utf-8") as f:
+                    pid_line, _, rest = f.read().partition("\n")
+                meta = json.loads(rest)
+                pid = int(pid_line.strip())
+            except (OSError, ValueError):
+                continue
+            if not isinstance(meta, dict) or meta.get("id") in live_ids or not self._pid_alive(pid):
+                continue
+            job_dir = os.path.join(self.farmout_home, "jobs", str(meta.get("id")))
+            rec = self._build_record(job_dir, meta, now_ms, stall_min, errors)
+            rec.update({"status": "queued", "pose": "queued", "tool": None})
+            out.append(rec)
+        return out
 
     @staticmethod
     def _today_totals(records, now_ms):
@@ -247,7 +273,7 @@ class JobsModel(object):
 
     @staticmethod
     def _in_jobs(record):
-        if record["status"] in ("running", "lost"):
+        if record["status"] in ("running", "lost", "queued"):
             return True
         return (
             record["mode"] == WRITE_MODE

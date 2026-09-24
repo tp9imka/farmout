@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.1 - 2026-09-24
+
+- `farmout status <id>` answers `queued` for a job waiting with `--queue`
+  (it said "no such job"), so the skill's monitor no longer treats a queued
+  job as finished. The monitor recipe waits through `queued` and starts the
+  stall clock at admission.
+- The dashboard shows queued jobs (QUEUED tag); queue tickets now carry the
+  job's metadata.
+- `run` reads the brief once at launch: a queued job could otherwise run
+  whatever the file held when it finally got a slot.
+- `status` no longer lists a launch that is still claiming its slot, and no
+  longer prints jq errors when such a job dir vanishes.
+
 ## 1.0.0 - 2026-09-24
 
 First public release.

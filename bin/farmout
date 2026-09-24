@@ -194,7 +194,9 @@ admit_queued() { # id job max_jobs meta_json
   local id="$1" job="$2" max="$3" meta_json="$4" ticket t first
   mkdir -p "$QUEUE_DIR"
   ticket="$QUEUE_DIR/$(perl -MTime::HiRes=time -e 'printf "%017.6f", time')-$id"
-  echo "$$" > "$ticket"
+  # Line 1: the waiter's pid (liveness). Rest: the job's meta, so
+  # `status <id>` can answer for a job that has no job dir yet.
+  { echo "$$"; printf '%s\n' "$meta_json"; } > "$ticket"
   trap 'rm -f "$ticket"' EXIT
   rm -rf "$job"
   local announced=false
@@ -202,7 +204,7 @@ admit_queued() { # id job max_jobs meta_json
     first=""
     for t in "$QUEUE_DIR"/*; do
       [ -f "$t" ] || continue
-      pid_alive "$(cat "$t" 2>/dev/null)" || { rm -f "$t"; continue; }
+      pid_alive "$(head -1 "$t" 2>/dev/null)" || { rm -f "$t"; continue; }
       first="$t"; break
     done
     if [ "$first" = "$ticket" ]; then
@@ -567,8 +569,25 @@ cmd_exec() { # internal: runs inside the new process group
   adapter_exec "$@"
 }
 
+# The ticket of a live waiter queued as <id>, if any.
+queued_ticket() { # id
+  local t
+  for t in "$QUEUE_DIR"/*-"$1"; do
+    [ -f "$t" ] && pid_alive "$(head -1 "$t" 2>/dev/null)" && { echo "$t"; return 0; }
+  done
+  return 1
+}
+
 cmd_status() {
   if [ -n "${1:-}" ]; then
+    # A live ticket means still queued: its job dir comes and goes while it
+    # retries admission, and the ticket carries its meta. The ticket is removed
+    # only once the job is admitted.
+    local t
+    if t="$(queued_ticket "$1")"; then
+      tail -n +2 "$t" | jq '.status = "queued"'
+      return
+    fi
     require_job "$1"
     jq --arg s "$(effective_status "$JOB")" '.status = $s' "$JOB/meta.json"
     return
@@ -577,15 +596,17 @@ cmd_status() {
   local land
   printf '%-34s %-12s %-8s %-6s %-10s %s\n' JOB STATUS CLI MODE LAND SNAPSHOT-OF
   for d in "$FARMOUT_HOME"/jobs/*/; do
-    [ -f "$d/meta.json" ] || continue
+    # Not yet admitted = a launch still claiming its slot (it may vanish on a
+    # retry); queued waiters are listed from their tickets below.
+    [ "$(jq -r '.admitted // true' "$d/meta.json" 2>/dev/null)" = true ] || continue
     d="${d%/}"
-    land="$(meta_get "$d" land)"
+    land="$(meta_get "$d" land 2>/dev/null)"
     printf '%-34s %-12s %-8s %-6s %-10s %s\n' "$(basename "$d")" "$(effective_status "$d")" \
       "$(meta_get "$d" cli)" "$(meta_get "$d" mode)" "${land:--}" "$(basename "$(meta_get "$d" repo)")"
   done
   local t name
   for t in "$QUEUE_DIR"/*; do
-    [ -f "$t" ] && pid_alive "$(cat "$t" 2>/dev/null)" || continue
+    [ -f "$t" ] && pid_alive "$(head -1 "$t" 2>/dev/null)" || continue
     name="${t##*/}"
     printf '%-34s %-12s\n' "${name#*-}" queued
   done

@@ -60,8 +60,8 @@ meta_set() { # dir [jq options...] filter
   local tmp="$dir/meta.json.tmp.$$"
   jq "$@" "$dir/meta.json" > "$tmp" && mv "$tmp" "$dir/meta.json"
 }
-meta_get() { # dir key
-  jq -r --arg k "$2" '.[$k] // empty' "$1/meta.json"
+meta_get() { # dir key - empty when the job dir is gone (a peer's admission retry)
+  jq -r --arg k "$2" '.[$k] // empty' "$1/meta.json" 2>/dev/null
 }
 
 # A zombie still answers kill -0, so check the process state instead.

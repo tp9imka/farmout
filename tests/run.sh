@@ -963,7 +963,7 @@ test_no_repo_job_runs_in_a_scratch_repo_and_cleans_it() {
 test_queue_admits_waiters_in_enqueue_order() {
   printf '%s\n' '{"limits":{"max_jobs":1}}' > "$T/config.json"; export FARMOUT_CONFIG="$T/config.json"
   export FARMOUT_QUEUE_POLL_S=0.2
-  brief "FAKE: sleep 2" "FAKE: print holder"
+  brief "FAKE: sleep 6" "FAKE: print holder"
   (cd "$REPO" && "$FARMOUT" run fake --brief "$T/brief.md") > "$T/o1" 2>&1 &
   local holder=$!; sleep 0.5
   printf '%s\n' "FAKE: sleep 1" "FAKE: print second" > "$T/b2.md"
@@ -976,6 +976,10 @@ test_queue_admits_waiters_in_enqueue_order() {
   local w3=$!
   local i=0; until "$FARMOUT" status | grep -q queued || [ $i -ge 50 ]; do sleep 0.1; i=$((i + 1)); done
   assert_contains "$("$FARMOUT" status)" queued
+  # The per-job lookup agrees with the list: a waiter is "queued", not "no such job".
+  local qid; qid="$("$FARMOUT" status | awk '$2 == "queued" {print $1; exit}')"
+  assert_eq "$("$FARMOUT" status "$qid" | jq -r .status)" queued
+  assert_eq "$("$FARMOUT" status "$qid" | jq -r .cli)" fake
   wait $holder $w2 $w3
   assert_contains "$(cat "$T/e2")" "queued"
   local id2 id3; id2="$(head -1 "$T/o2")"; id3="$(head -1 "$T/o3")"

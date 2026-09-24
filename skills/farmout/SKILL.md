@@ -150,7 +150,9 @@ STALL_MINUTES="$(jq -r '.limits.stall_min // empty' "${FARMOUT_CONFIG:-$HOME/.co
 case "$STALL_MINUTES" in ''|*[!0-9]*) STALL_MINUTES=10 ;; esac
 [ "$STALL_MINUTES" -ge 1 ] && [ "$STALL_MINUTES" -le 120 ] || STALL_MINUTES=10
 last=""; since=$(date +%s)
-while [ "$($D status "$ID" | jq -r .status)" = running ]; do
+while st="$($D status "$ID" | jq -r .status)"; [ "$st" = running ] || [ "$st" = queued ]; do
+  # Queued: no worker yet, so no stall clock - it starts when the job is admitted.
+  if [ "$st" = queued ]; then since=$(date +%s); sleep 30; continue; fi
   p="$($D progress "$ID")"
   if ! printf '%s' "$p" | jq -e .unknown >/dev/null; then
     ev="$(printf '%s' "$p" | jq .events)"; open="$(printf '%s' "$p" | jq .open_tools)"
@@ -163,6 +165,9 @@ while [ "$($D status "$ID" | jq -r .status)" = running ]; do
 done
 $D status "$ID" | jq -r .status
 ```
+
+Keep any monitor you write bash 3.2-compatible (macOS `/bin/bash`): no
+`declare -A`, no `mapfile`.
 
 If it prints `stalled`, tail `~/.cache/farmout/jobs/<id>/log`, tell the user
 what it shows (a login prompt, a retry loop, silence), and offer

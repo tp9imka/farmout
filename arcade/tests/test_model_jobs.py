@@ -794,3 +794,27 @@ class OutFilesTest(ModelJobsTestCase):
         _write_job(self.home, "j1", meta=_base_meta("j1", status="ok", ended=_iso(2026, 9, 23, 14, 30, 0)), log_lines=[])
         rec = (lambda s: (s["jobs"] + s["hof"])[0])(model_jobs.JobsModel(self.home).snapshot(NOW_MS, stall_min=10))
         self.assertEqual(rec["out"], [])
+
+
+class QueuedTicketTest(ModelJobsTestCase):
+    def _ticket(self, pid, job_id, name):
+        qdir = os.path.join(self.home, "queue")
+        os.makedirs(qdir, exist_ok=True)
+        meta = _base_meta(job_id, status="running", sup_pid=pid, title="waiting lane")
+        with open(os.path.join(qdir, name), "w", encoding="utf-8") as f:
+            f.write("{}\n{}\n".format(pid, json.dumps(meta)))
+
+    def test_live_ticket_is_a_queued_job(self):
+        self._ticket(4242, "20260924-100000-codex-aaaa", "0001.000000-20260924-100000-codex-aaaa")
+        snap = model_jobs.JobsModel(self.home, pid_alive=lambda pid: pid == 4242).snapshot(NOW_MS, stall_min=10)
+        rec = snap["jobs"][0]
+        self.assertEqual((rec["status"], rec["pose"], rec["title"]), ("queued", "queued", "waiting lane"))
+
+    def test_dead_waiter_and_garbage_tickets_are_ignored(self):
+        self._ticket(4242, "20260924-100000-codex-aaaa", "0001.000000-20260924-100000-codex-aaaa")
+        qdir = os.path.join(self.home, "queue")
+        with open(os.path.join(qdir, "0002.000000-junk"), "w") as f:
+            f.write("not a pid\n{")
+        snap = model_jobs.JobsModel(self.home, pid_alive=lambda pid: False).snapshot(NOW_MS, stall_min=10)
+        self.assertEqual(snap["jobs"], [])
+        self.assertEqual(snap["errors"], [])

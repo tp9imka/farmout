@@ -385,3 +385,12 @@ test('focus job: out files reach the view, none by default', () => {
   assert.deepEqual(focusJobVM(job({ out: ['/j/out/report.md'] }), 0, '1').out, ['/j/out/report.md']);
   assert.deepEqual(focusJobVM(job({}), 0, '1').out, []);
 });
+
+test('queued job: its own tag and an idle sprite, never CLEAR', () => {
+  const rec = job({ status: 'queued', pose: 'queued' });
+  assert.equal(stageOf('worker', rec), 'queued');
+  assert.equal(tagFor('worker', rec, '1').label, 'QUEUED');
+  assert.equal(spritePose('worker', rec), 'idle');
+  assert.equal(tileVM(rec, 'worker', 0, { blink: '1' }).clearOv, false);
+  assert.equal(focusJobVM(rec, 0, '1').actionNote, 'QUEUED · WAITING FOR A SLOT');
+});
