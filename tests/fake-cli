@@ -11,7 +11,7 @@ while IFS= read -r line; do
     echo-brief) printf '%s\n' "$brief" ;;
     cat) cat "$1" ;;
     write) f="$1"; shift; printf '%s\n' "$*" > "$f" ;;
-    sed) e="$1"; f="$2"; /usr/bin/sed -i "" "$e" "$f" ;;
+    sed) e="$1"; f="$2"; sed "$e" "$f" > "$f.fake-tmp" && mv "$f.fake-tmp" "$f" ;;
     trailing-ws) printf 'four \n' >> "$1" ;;
     ln) ln -s "$1" "$2" ;;
     mkdir) mkdir -p "$1" ;;

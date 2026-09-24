@@ -279,6 +279,9 @@ cmd_run() {
   done
   [ "$cli" = auto ] || adapter_known "$cli" || die "unknown cli '$cli' (known: $ADAPTERS, or auto)"
   [ -n "$brief" ] && [ -f "$brief" ] || die "--brief <file> is required"
+  # Read once, now: a queued job may wait a long time, and the brief file can
+  # be edited or reused for the next job meanwhile. (The x keeps trailing newlines.)
+  local brief_text; brief_text="$(cat "$brief"; printf x)"; brief_text="${brief_text%x}"
   [ -z "$kind" ] || cfg_valid_kind "$kind" || die "unknown kind '$kind' (known: $CFG_KINDS)"
   [ "$cli" != auto ] || [ -n "$kind" ] || die "auto requires --kind"
   [ -z "$model" ] || cfg_valid_model "$model" || die "invalid --model '$model'"
@@ -332,7 +335,7 @@ cmd_run() {
 
   # The worker runs in a separate worktree; an absolute path into the source
   # checkout would let an auto-approved worker edit the source directly.
-  grep -qF "$repo/" "$brief" \
+  printf '%s' "$brief_text" | grep -qF "$repo/" \
     && die "brief contains the source checkout's absolute path ($repo/); use repo-relative paths - the worker runs in a separate worktree"
 
   # --out: files a read job hands back (reports); copied out before its
@@ -439,7 +442,7 @@ cmd_run() {
   # Every brief opens with the isolation rule: the worktree is the boundary
   # only while the worker stays in it, and a worker handed the wrong repo will
   # otherwise go and find the right one - the user's live checkout.
-  { printf '%s\n' "$BRIEF_PREAMBLE"; cat "$brief"; } > "$job/brief.md"
+  { printf '%s\n' "$BRIEF_PREAMBLE"; printf '%s' "$brief_text"; } > "$job/brief.md"
 
   echo "$id"
   echo "farmout: $id repo=$(basename "$repo") base=$(printf '%.7s' "$snap") mode=$mode${ref:+ ref=$ref}${scratch:+ (scratch)}" >&2
@@ -448,7 +451,7 @@ cmd_run() {
   local u
   if [ "$untracked" -gt 0 ]; then
     while IFS= read -r u; do
-      [ -n "$u" ] && grep -qF -- "$u" "$brief" && ! printf '%s\n' ${with_paths[@]+"${with_paths[@]}"} | grep -qxF -- "$u" \
+      [ -n "$u" ] && printf '%s' "$brief_text" | grep -qF -- "$u" && ! printf '%s\n' ${with_paths[@]+"${with_paths[@]}"} | grep -qxF -- "$u" \
         && warn "the brief names untracked '$u', which is not in the worker's snapshot (pass it with --with)"
     done < <(git -C "$repo" ls-files --others --exclude-standard)
   fi

@@ -555,8 +555,10 @@ test_admission_stress_5_starts_max_2() {
   local cfg="$T/config.json"
   printf '%s\n' '{"limits":{"max_jobs":2}}' > "$cfg"
   export FARMOUT_CONFIG="$cfg"
-  brief "FAKE: sleep 3" "FAKE: print a"
-  local iterations=3 iter
+  # Each admitted job holds its slot for 8s, longer than launch jitter on a
+  # loaded machine: a late launch must meet two running jobs, never a freed slot.
+  brief "FAKE: sleep 8" "FAKE: print a"
+  local iterations=2 iter
   for iter in $(seq 1 "$iterations"); do
     local k
     for k in 1 2 3 4 5; do
@@ -971,7 +973,8 @@ test_queue_admits_waiters_in_enqueue_order() {
   (cd "$REPO" && "$FARMOUT" run fake --queue --brief "$T/b2.md") > "$T/o2" 2>"$T/e2" &
   local w2=$!; sleep 0.5
   (cd "$REPO" && "$FARMOUT" run fake --queue --brief "$T/b3.md") > "$T/o3" 2>/dev/null &
-  local w3=$!; sleep 0.3
+  local w3=$!
+  local i=0; until "$FARMOUT" status | grep -q queued || [ $i -ge 50 ]; do sleep 0.1; i=$((i + 1)); done
   assert_contains "$("$FARMOUT" status)" queued
   wait $holder $w2 $w3
   assert_contains "$(cat "$T/e2")" "queued"
@@ -983,6 +986,21 @@ test_queue_admits_waiters_in_enqueue_order() {
   # The second job sleeps 1s holding the only slot, so strict order is observable.
   [ "$(meta "$id2" admitted_at)" \< "$(meta "$id3" admitted_at)" ] \
     || fail "third admitted before second: $(meta "$id2" admitted_at) vs $(meta "$id3" admitted_at)"
+  unset FARMOUT_CONFIG FARMOUT_QUEUE_POLL_S
+}
+
+test_queued_job_runs_the_brief_it_was_launched_with() {
+  printf '%s\n' '{"limits":{"max_jobs":1}}' > "$T/config.json"; export FARMOUT_CONFIG="$T/config.json"
+  export FARMOUT_QUEUE_POLL_S=0.2
+  brief "FAKE: sleep 2" "FAKE: print holder"
+  (cd "$REPO" && "$FARMOUT" run fake --brief "$T/brief.md") >/dev/null 2>&1 &
+  local holder=$!; sleep 0.5
+  brief "FAKE: print original"
+  (cd "$REPO" && "$FARMOUT" run fake --queue --brief "$T/brief.md") > "$T/oq" 2>/dev/null &
+  local waiter=$!; sleep 0.5
+  brief "FAKE: print replaced"   # the caller reuses the file while the job waits
+  wait $holder $waiter
+  assert_contains "$(result "$(head -1 "$T/oq")")" original
   unset FARMOUT_CONFIG FARMOUT_QUEUE_POLL_S
 }
 
