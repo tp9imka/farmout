@@ -603,6 +603,25 @@ class StateRobustnessTestCase(_ServerTestCase):
         self.assertEqual(500, resp.status)
         self.assertEqual({"errors": ["state: KeyError"]}, data)
 
+    def test_state_answers_while_worktree_git_is_slow(self):
+        # 8 running write jobs whose git calls take 2 s each: the browser's
+        # 5 s poll timeout must still see an answer.
+        def slow_git(args, cwd):
+            time.sleep(2)
+            return ""
+
+        self.srv.jobs_model._run_git = slow_git
+        for i in range(8):
+            job_id = _job_id("%04x" % i)
+            self._write_job(job_id, _job_meta(job_id, mode="write", sup_pid=os.getpid(),
+                                              base="abc", worktree="/wt/" + job_id))
+        for _ in range(3):
+            started = time.monotonic()
+            resp, data = self._get("/api/state")
+            self.assertEqual(200, resp.status)
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertEqual(8, len(data["jobs"]))
+
     def test_crew_includes_finished_jobs_from_hof(self):
         session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         pid, proc_start = 555555, "Wed Sep 23 06:29:13 2026"

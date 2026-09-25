@@ -5,6 +5,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -445,7 +447,7 @@ class FilesFieldTest(GitRepoTestCase):
         self.assertEqual(by_name["tracked.txt"], {"n": "tracked.txt", "a": 1, "d": 0})
         self.assertEqual(by_name["new.txt"], {"n": "new.txt", "a": 3, "d": 0})
 
-    def test_running_write_job_files_cached_until_log_grows(self):
+    def test_running_write_job_files_cached_until_refresh_interval(self):
         repo, base = self._init_repo()
         worktree = os.path.join(self.home, "wt")
         self._git(["worktree", "add", "-q", "--detach", worktree, base], repo)
@@ -456,22 +458,26 @@ class FilesFieldTest(GitRepoTestCase):
             calls.append(args)
             return model_jobs.default_run_git(args, cwd)
 
+        clock = [1000.0]
         meta = _base_meta("jw", mode="write", status="running", sup_pid=123,
                            repo=repo, base=base, worktree=worktree)
         job_dir = _write_job(self.home, "jw", meta=meta, log_lines=["a"])
-        model = model_jobs.JobsModel(self.home, pid_alive=lambda pid: True, run_git=counting_git)
+        model = model_jobs.JobsModel(self.home, pid_alive=lambda pid: True, run_git=counting_git,
+                                     clock=lambda: clock[0])
 
         model.snapshot(NOW_MS, stall_min=60)
         first_count = len(calls)
         self.assertGreater(first_count, 0)
 
-        model.snapshot(NOW_MS, stall_min=60)
-        self.assertEqual(len(calls), first_count, "unchanged log must not re-run git")
-
         with open(os.path.join(job_dir, "log"), "a") as f:
             f.write("b\n")
+        clock[0] += model_jobs.FILES_REFRESH_S - 1
         model.snapshot(NOW_MS, stall_min=60)
-        self.assertGreater(len(calls), first_count, "grown log must re-run git")
+        self.assertEqual(len(calls), first_count, "a growing log alone must not re-run git")
+
+        clock[0] += 1
+        model.snapshot(NOW_MS, stall_min=60)
+        self.assertGreater(len(calls), first_count, "an expired measurement must re-run git")
 
     def test_finished_write_job_files_from_real_diff_patch(self):
         repo, base = self._init_repo()
@@ -694,6 +700,12 @@ class GitFailureTest(ModelJobsTestCase):
         rec = model.snapshot(NOW_MS, stall_min=10)["jobs"][0]
         self.assertIsNone(rec["files"])
 
+    @mock.patch("model_jobs.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(["git"], model_jobs.GIT_TIMEOUT_S))
+    def test_default_run_git_returns_none_on_timeout(self, mock_run):
+        self.assertIsNone(model_jobs.default_run_git(["status"], "/tmp"))
+        self.assertEqual(model_jobs.GIT_TIMEOUT_S, mock_run.call_args[1]["timeout"])
+
     def test_default_run_git_returns_none_on_nonzero_exit(self):
         out = model_jobs.default_run_git(["this-is-not-a-git-subcommand"], "/tmp")
         self.assertIsNone(out)
@@ -777,6 +789,71 @@ class RunningToFinishedTransitionTest(ModelJobsTestCase):
 
         rec2 = model.snapshot(NOW_MS, stall_min=60)["jobs"][0]
         self.assertEqual(rec2["files"], [{"n": "baz.py", "a": 9, "d": 1}])
+
+
+class BackgroundFilesTest(ModelJobsTestCase):
+    """With background_files a snapshot never calls git; the refresher does."""
+
+    SETTLE_S = 5
+
+    def _running_write_job(self, job_id):
+        meta = _base_meta(job_id, mode="write", status="running", sup_pid=123,
+                          repo="/repo", base="abc", worktree="/wt/" + job_id)
+        _write_job(self.home, job_id, meta=meta, log_lines=[])
+
+    def _model(self, run_git):
+        model = model_jobs.JobsModel(self.home, pid_alive=lambda pid: True, run_git=run_git,
+                                     background_files=True)
+        self.addCleanup(model.close)
+        return model
+
+    def _wait_for(self, predicate):
+        deadline = time.monotonic() + self.SETTLE_S
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_snapshot_does_not_wait_on_slow_git(self):
+        release = threading.Event()
+        callers = []
+
+        def blocking_git(args, cwd):
+            callers.append(threading.current_thread())
+            release.wait(self.SETTLE_S)
+            return ""
+
+        for i in range(8):
+            self._running_write_job("jw%d" % i)
+        model = self._model(blocking_git)
+        started = time.monotonic()
+        snap = model.snapshot(NOW_MS, stall_min=60)
+        elapsed = time.monotonic() - started
+        release.set()
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual([None] * 8, [r["files"] for r in snap["jobs"]], "unmeasured until the refresher reports")
+        self.assertTrue(self._wait_for(lambda: callers))
+        self.assertNotIn(threading.current_thread(), callers)
+
+    def test_refresher_result_is_served_on_the_next_snapshot(self):
+        def fake_git(args, cwd):
+            return "2\t1\tsrc.txt\n" if args[0] == "diff" else ""
+
+        self._running_write_job("jw")
+        model = self._model(fake_git)
+        model.snapshot(NOW_MS, stall_min=60)
+        self.assertTrue(self._wait_for(
+            lambda: model.snapshot(NOW_MS, stall_min=60)["jobs"][0]["files"] is not None))
+        self.assertEqual([{"n": "src.txt", "a": 2, "d": 1}],
+                         model.snapshot(NOW_MS, stall_min=60)["jobs"][0]["files"])
+
+    def test_close_stops_the_refresher(self):
+        model = self._model(lambda args, cwd: "")
+        model.close()
+        self.assertTrue(self._wait_for(
+            lambda: not any(t.name == "arcade-files" and t.is_alive() for t in threading.enumerate())))
 
 
 if __name__ == "__main__":
