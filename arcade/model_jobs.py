@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 
 import logs
@@ -22,6 +23,14 @@ HOF_MAX = 10
 _LAND_POSE = {None: "ready", "landed": "landed", "conflict": "conflict", "discarded": "discarded"}
 
 _SENTENCE_RE = re.compile(r".*?[.!?](?=\s|$)")
+
+# A running write job's files[] is re-measured at most this often. Its log
+# grows every second, so log growth says nothing about the worktree changing.
+FILES_REFRESH_S = 30
+# How often the background refresher looks for due jobs.
+FILES_TICK_S = 2
+# A git call past this reads as unmeasured instead of blocking the refresher.
+GIT_TIMEOUT_S = 20
 
 
 def _is_today(started_ms, now_ms):
@@ -60,18 +69,18 @@ def default_pid_alive(pid):
 def default_run_git(args, cwd):
     """Every server-side git call must never take a live worker's index.lock.
 
-    None signals the call itself failed (missing binary or nonzero exit) --
-    distinct from "" (ran fine, produced no output), so a caller can tell
-    "unmeasurable" from "measured: no changes".
+    None signals the call itself failed (missing binary, nonzero exit or
+    timeout) -- distinct from "" (ran fine, produced no output), so a caller
+    can tell "unmeasurable" from "measured: no changes".
     """
     env = dict(os.environ)
     env["GIT_OPTIONAL_LOCKS"] = "0"
     try:
         proc = subprocess.run(
             ["git"] + list(args), cwd=cwd, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=GIT_TIMEOUT_S
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode != 0:
         return None
@@ -169,18 +178,43 @@ def _count_lines(path):
 class JobsModel(object):
     """Snapshots every job dir under `$FARMOUT_HOME/jobs` into dashboard
     records. Instances hold per-job caches (log parse state, files[] result)
-    that persist across snapshot() calls, so repeated polls stay cheap."""
+    that persist across snapshot() calls, so repeated polls stay cheap.
 
-    def __init__(self, farmout_home, pid_alive=None, run_git=None):
+    files[] costs git calls that take seconds in a large worktree. With
+    background_files a refresher thread measures them and snapshot() only
+    reads its last result (null until the first measurement), so a snapshot
+    never waits on git. Without it snapshot() measures inline when due.
+    """
+
+    def __init__(self, farmout_home, pid_alive=None, run_git=None,
+                 background_files=False, clock=None):
         self.farmout_home = farmout_home
         self._pid_alive = pid_alive or default_pid_alive
         self._run_git = run_git or default_run_git
+        self._clock = clock or time.monotonic
         self._readers = {}
         self._log_states = {}
         self._log_stat = {}
-        self._files_cache = {}
         # job_id -> (progress event count, ms when that count was first seen)
         self._progress_seen = {}
+
+        # Shared with the refresher thread; guarded by _files_lock.
+        # _files_wanted: job_id -> spec tuple from the latest snapshot.
+        # _files_cache: job_id -> {"final", "at", "files"}.
+        self._files_lock = threading.Lock()
+        self._files_wanted = {}
+        self._files_cache = {}
+        self._files_wake = threading.Event()
+        self._closed = threading.Event()
+        self._background = background_files
+        if background_files:
+            t = threading.Thread(target=self._refresh_loop, name="arcade-files")
+            t.daemon = True
+            t.start()
+
+    def close(self):
+        self._closed.set()
+        self._files_wake.set()
 
     def snapshot(self, now_ms, stall_min):
         errors = []
@@ -282,11 +316,12 @@ class JobsModel(object):
         )
 
     def _prune(self, live_ids):
-        caches = (self._readers, self._log_states, self._log_stat, self._files_cache, self._progress_seen)
-        for cache in caches:
-            for job_id in list(cache):
-                if job_id not in live_ids:
-                    del cache[job_id]
+        caches = (self._readers, self._log_states, self._log_stat, self._progress_seen)
+        with self._files_lock:
+            for cache in caches + (self._files_wanted, self._files_cache):
+                for job_id in list(cache):
+                    if job_id not in live_ids:
+                        del cache[job_id]
 
     def _build_record(self, job_dir, meta, now_ms, stall_min, errors):
         job_id = meta.get("id") or os.path.basename(job_dir)
@@ -319,7 +354,7 @@ class JobsModel(object):
             title = _first_sentence(brief_text, TITLE_MAX)
 
         repo = meta.get("repo")
-        files = self._files_for(job_id, job_dir, meta, mode, is_ended, log_path)
+        files = self._files_for(job_id, job_dir, meta, mode, is_ended)
 
         return {
             "id": job_id,
@@ -431,31 +466,60 @@ class JobsModel(object):
             return False
         return (now_ms - seen[1]) / 60000.0 > stall_min
 
-    def _files_for(self, job_id, job_dir, meta, mode, is_ended, log_path):
+    def _files_for(self, job_id, job_dir, meta, mode, is_ended):
         if mode != WRITE_MODE:
             return None
-        cache = self._files_cache.get(job_id)
+        spec = (job_dir, meta.get("worktree"), meta.get("base"), meta.get("repo"), is_ended)
+        with self._files_lock:
+            self._files_wanted[job_id] = spec
+            cached = self._files_cache.get(job_id)
+            due = self._files_due(cached, is_ended)
+        if due:
+            if self._background:
+                self._files_wake.set()
+            else:
+                self._measure_files(job_id, spec)
+                with self._files_lock:
+                    cached = self._files_cache.get(job_id)
+        return cached["files"] if cached else None
 
+    def _files_due(self, cached, is_ended):
+        if cached is None:
+            return True
+        if cached["final"]:
+            return False
+        return is_ended or self._clock() - cached["at"] >= FILES_REFRESH_S
+
+    def _measure_files(self, job_id, spec):
+        job_dir, worktree, base, repo, is_ended = spec
         if is_ended:
-            if cache and cache.get("final"):
-                return cache["files"]
-            files = self._files_from_patch(job_dir, meta)
-            self._files_cache[job_id] = {"final": True, "files": files}
-            return files
+            files = self._files_from_patch(job_dir, repo)
+        else:
+            files = self._files_from_worktree(worktree, base)
+        with self._files_lock:
+            # A job pruned while git ran must not be resurrected.
+            if self._files_wanted.get(job_id) == spec:
+                self._files_cache[job_id] = {"final": is_ended, "at": self._clock(), "files": files}
 
-        try:
-            size = os.stat(log_path).st_size
-        except OSError:
-            size = None
-        if cache and not cache.get("final") and cache.get("size") == size:
-            return cache["files"]
-        files = self._files_from_worktree(meta)
-        self._files_cache[job_id] = {"final": False, "size": size, "files": files}
-        return files
+    def _refresh_due(self):
+        with self._files_lock:
+            due = [(job_id, spec) for job_id, spec in self._files_wanted.items()
+                   if self._files_due(self._files_cache.get(job_id), spec[4])]
+        for job_id, spec in due:
+            if self._closed.is_set():
+                return
+            self._measure_files(job_id, spec)
 
-    def _files_from_worktree(self, meta):
-        worktree = meta.get("worktree")
-        base = meta.get("base")
+    def _refresh_loop(self):
+        while not self._closed.is_set():
+            try:
+                self._refresh_due()
+            except Exception:  # the refresher must outlive one bad job
+                pass
+            self._files_wake.wait(FILES_TICK_S)
+            self._files_wake.clear()
+
+    def _files_from_worktree(self, worktree, base):
         if not worktree or not base:
             return None
         diff_out = self._run_git(["diff", "--numstat", base], worktree)
@@ -473,11 +537,11 @@ class JobsModel(object):
             files.append({"n": name, "a": count, "d": None if count is None else 0})
         return files
 
-    def _files_from_patch(self, job_dir, meta):
+    def _files_from_patch(self, job_dir, repo):
         patch_path = os.path.join(job_dir, "diff.patch")
         if not os.path.isfile(patch_path):
             return None
-        cwd = meta.get("repo") or job_dir
+        cwd = repo or job_dir
         out = self._run_git(["apply", "--numstat", patch_path], cwd)
         if out is None:
             return None

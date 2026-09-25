@@ -127,6 +127,8 @@ class ArcadeHTTPServer(http.server.ThreadingHTTPServer):
 
     def __init__(self, addr, handler_cls, *, token, farmout_bin, farmout_home,
                  claude_home, config_path, static_dir):
+        # Before the bind: a failed bind calls server_close(), which closes it.
+        self.jobs_model = model_jobs.JobsModel(farmout_home, background_files=True)
         super().__init__(addr, handler_cls)
         self.token = token
         self.farmout_bin = farmout_bin
@@ -134,10 +136,13 @@ class ArcadeHTTPServer(http.server.ThreadingHTTPServer):
         self.claude_home = claude_home
         self.config_path = config_path
         self.static_dir = os.path.realpath(static_dir)
-        self.jobs_model = model_jobs.JobsModel(farmout_home)
         self.sessions_model = model_sessions.SessionsModel(claude_home)
         self.state_lock = threading.Lock()
         self.job_locks = _JobLocks()
+
+    def server_close(self):
+        self.jobs_model.close()
+        super().server_close()
 
     def handle_error(self, request, client_address):
         # The stdlib default prints the full traceback (request included)
