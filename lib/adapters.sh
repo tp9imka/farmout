@@ -1,9 +1,11 @@
 # shellcheck shell=bash
 # One entry per worker CLI. Adding a CLI = one case in each function below.
 # Flags and output shapes probed 2026-09-23: codex 0.155.1, kiro-cli 2.21.2,
-# copilot 1.0.88, cursor-agent 2026.09.10.
+# copilot 1.0.88, cursor-agent 2026.09.10. kiro engine v3 (KAS 0.58.7) probed
+# 2026-09-28: same stream-json envelope, but no metadata/meteringUsage events.
 
 ADAPTERS="codex kiro copilot cursor fake"
+KIRO_ENGINE_DEFAULT=v2
 
 adapter_known() {
   case " $ADAPTERS " in *" $1 "*) return 0 ;; esac
@@ -40,7 +42,7 @@ adapter_effective_effort() { # cli model effort
 # (adapter_effective_effort is called once, by the caller) - this function
 # must not call it again.
 _adapter_build_argv() { # cli jobdir worktree model effort
-  local cli="$1" job="$2" wt="$3" model="$4" effort="$5" brief
+  local cli="$1" job="$2" wt="$3" model="$4" effort="$5" brief engine
   brief="$(cat "$job/brief.md")"
   ADAPTER_ARGV=()
   case "$cli" in
@@ -54,7 +56,8 @@ _adapter_build_argv() { # cli jobdir worktree model effort
       [ -n "$effort" ] && ADAPTER_ARGV+=(-c "model_reasoning_effort=$effort")
       ADAPTER_ARGV+=("$brief") ;;
     kiro)
-      ADAPTER_ARGV=(kiro-cli chat -a --agent-engine v2 --output-format stream-json)
+      engine="$(jq -r '.engine // empty' "$job/meta.json" 2>/dev/null)"
+      ADAPTER_ARGV=(kiro-cli chat -a --agent-engine "${engine:-$KIRO_ENGINE_DEFAULT}" --output-format stream-json)
       [ -n "$model" ] && ADAPTER_ARGV+=(--model "$model")
       [ -n "$effort" ] && ADAPTER_ARGV+=(--effort "$effort")
       ADAPTER_ARGV+=("$brief") ;;

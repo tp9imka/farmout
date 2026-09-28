@@ -253,6 +253,17 @@ class ConfigTestCase(unittest.TestCase):
         self.assertEqual(sum(1 for w in warnings if "workers.codex.models[]" in w), 2)
         self.assertEqual(config.validate(cfg), [])
 
+    def test_kiro_engine_kept_and_validated(self):
+        cfg = config.merge_defaults({"workers": {"kiro": {"engine": "v3"}}})
+        self.assertEqual(cfg["workers"]["kiro"]["engine"], "v3")
+        self.assertNotIn("engine", cfg["workers"]["codex"])
+        self.assertEqual(config.validate(cfg), [])
+        self.assertIsNone(config.merge_defaults({"workers": {"kiro": {"engine": "v9"}}})["workers"]["kiro"]["engine"])
+        self.assertEqual(config.raw_warnings({"workers": {"kiro": {"engine": "v9"}}}),
+                         ["workers.kiro.engine 'v9' ignored (expected v1, v2, v3)"])
+        cfg["workers"]["codex"]["engine"] = "v3"
+        self.assertIn("engine", config.validate(cfg)[0])
+
     def test_invalid_routing_rule_dropped_others_kept(self):
         good_a = {"kind": "review", "prefer": "codex", "fallback": None}
         good_b = {"kind": "implement", "prefer": "cursor", "fallback": "codex"}

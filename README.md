@@ -116,7 +116,7 @@ Optional. `~/.config/farmout/config.json`, also editable from the arcade's SETUP
 {
   "workers": {
     "codex":  { "enabled": true, "effort": "high", "timeout_min": 30 },
-    "kiro":   { "enabled": true, "timeout_min": 20 },
+    "kiro":   { "enabled": true, "timeout_min": 20, "engine": "v3" },
     "cursor": { "enabled": false }
   },
   "routing": [
@@ -127,7 +127,7 @@ Optional. `~/.config/farmout/config.json`, also editable from the arcade's SETUP
 }
 ```
 
-Built-in routing when there's no `routing` key: review => codex, bulk-read => kiro, research => kiro, implement => cursor, second-opinion => copilot, each with a fallback. Jobs live in `~/.cache/farmout` (override with `FARMOUT_HOME`).
+Built-in routing when there's no `routing` key: review => codex, bulk-read => kiro, research => kiro, implement => cursor, second-opinion => copilot, each with a fallback. `workers.kiro.engine` picks Kiro's agent engine (`v1`, `v2` or `v3`; default `v2`). On `v3` the arcade shows no credit count, since v3 doesn't report metering in its event stream. Jobs live in `~/.cache/farmout` (override with `FARMOUT_HOME`).
 
 ## Uninstall
 

@@ -282,6 +282,12 @@ class AccumulationSemanticsTest(unittest.TestCase):
         state.feed(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 50, "output_tokens": 5}}))
         self.assertEqual(state.tokens, (100 + 10) + (50 + 5))
 
+    def test_kiro_kindless_tool_call_not_replayed(self):
+        state = logs.new_log_state("kiro")
+        state.feed(json.dumps({"type": "sessionUpdate", "data": {"update": {
+            "sessionUpdate": "tool_call", "kind": None, "title": "Fetching your cloud config"}}}))
+        self.assertEqual(state.replay, [])
+
     def test_kiro_coins_accumulate_across_metadata_events(self):
         state = logs.new_log_state("kiro")
         ev1 = {"type": "metadata", "data": {"meteringUsage": [{"value": 0.01, "unit": "credit"}]}}

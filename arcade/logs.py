@@ -206,8 +206,10 @@ def _kiro_parse(state, obj):
     kind = obj.get("type")
     if kind == "sessionUpdate":
         update = (obj.get("data") or {}).get("update") or {}
-        if update.get("sessionUpdate") == "tool_call":
-            tool_kind = update.get("kind") or ""
+        # v3 also emits kind-less tool_calls for its own housekeeping
+        # ("Fetching your cloud config"); only the worker's tools are replayed.
+        if update.get("sessionUpdate") == "tool_call" and update.get("kind"):
+            tool_kind = update["kind"]
             tool = _KIRO_KIND_TOOL.get(tool_kind, _pascal_case(tool_kind))
             title = update.get("title") or ""
             state._add_replay_verbatim(tool, title)
