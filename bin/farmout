@@ -312,6 +312,7 @@ cmd_run() {
 
   [ -n "$model" ] || model="$(cfg_worker "$cli" model)"
   [ -n "$effort" ] || effort="$(cfg_worker "$cli" effort)"
+  local engine=""; [ "$cli" = kiro ] && engine="$(cfg_worker kiro engine)"
   local effort_final; effort_final="$(adapter_effective_effort "$cli" "$model" "$effort")"
   [ -n "$title" ] || title="$(derive_title "$brief")"
 
@@ -412,7 +413,7 @@ cmd_run() {
     --arg repo "$repo" --arg base "$snap" --arg branch "$branch" --arg wt "$wt" \
     --arg started "$(now_iso)" --argjson timeout_s "$timeout_s" --argjson untracked "$untracked" \
     --argjson sup "$$" \
-    --arg kind "$kind" --arg title "$title" --arg model "$model" --arg effort "$effort_final" \
+    --arg kind "$kind" --arg title "$title" --arg model "$model" --arg effort "$effort_final" --arg engine "$engine" \
     --arg route "$route" \
     --arg source_branch "$source_branch" --arg parent_session "${CLAUDE_CODE_SESSION_ID:-}" \
     --arg parent_pid "${CLAUDE_PID:-}" \
@@ -429,6 +430,7 @@ cmd_run() {
       title:(if $title == "" then null else $title end),
       model:(if $model == "" then null else $model end),
       effort:(if $effort == "" then null else $effort end),
+      engine:(if $engine == "" then null else $engine end),
       route:(if $route == "" then null else $route end),
       source_branch:(if $source_branch == "" then null else $source_branch end),
       parent_session:(if $parent_session == "" then null else $parent_session end),

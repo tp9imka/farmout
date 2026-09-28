@@ -133,6 +133,11 @@ test_effort_argv_per_cli() {
   out="$(adapter_argv kiro "$j" /wt m high 2>/dev/null)"
   assert_contains "$out" $'\n--model\nm' kiro-model
   assert_contains "$out" $'\n--effort\nhigh' kiro-effort
+  assert_contains "$out" $'\n--agent-engine\nv2\n' kiro-engine-default
+  printf '%s\n' '{"engine":"v3"}' > "$j/meta.json"
+  out="$(adapter_argv kiro "$j" /wt "" "" 2>/dev/null)"
+  assert_contains "$out" $'\n--agent-engine\nv3\n' kiro-engine-from-meta
+  rm -f "$j/meta.json"
 
   out="$(adapter_argv cursor "$j" /wt m high 2>/dev/null)"
   assert_contains "$out" $'\n--model\nm[effort=high]' cursor-model-effort
@@ -192,6 +197,19 @@ test_config_digit_strings_and_typed_values() {
   assert_eq "$(cfg_worker fake enabled 2>"$T/e2")" "" string-enabled
   assert_contains "$(cat "$T/e2")" "invalid workers.fake.enabled"
   assert_eq "$(cfg_worker fake model 2>/dev/null)" "" number-model
+}
+
+test_config_kiro_engine() {
+  . "$ROOT/lib/common.sh"; . "$ROOT/lib/adapters.sh"; . "$ROOT/lib/config.sh"
+  export FARMOUT_CONFIG="$T/config.json"
+  printf '%s\n' '{"workers":{"kiro":{"engine":"v3"},"fake":{"engine":"v3"}}}' > "$FARMOUT_CONFIG"
+  cfg_load
+  assert_eq "$(cfg_worker kiro engine)" v3 kiro-engine
+  assert_eq "$(cfg_worker fake engine 2>"$T/e1")" "" engine-is-kiro-only
+  assert_contains "$(cat "$T/e1")" "invalid workers.fake.engine"
+  printf '%s\n' '{"workers":{"kiro":{"engine":"v9"}}}' > "$FARMOUT_CONFIG"
+  cfg_load
+  assert_eq "$(cfg_worker kiro engine 2>/dev/null)" "" unknown-engine
 }
 
 test_config_timeout_precedence() {

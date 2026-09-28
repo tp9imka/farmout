@@ -29,7 +29,7 @@ Tool: `farmout` (on PATH after `install.sh`; inside the plugin it is `${CLAUDE_P
 | cli | Notes |
 |---|---|
 | `codex` | Uses `~/.codex/config.toml` defaults unless `--model` is given |
-| `kiro` | Spends Kiro credits; runs on Kiro's v2 engine |
+| `kiro` | Spends Kiro credits; engine from `workers.kiro.engine` (default v2) |
 | `copilot` | Login cannot be checked (`doctor` says `not-verified`) |
 | `cursor` | |
 

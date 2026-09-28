@@ -17,6 +17,7 @@ import threading
 CLIS = ("codex", "kiro", "copilot", "cursor")
 KINDS = ("review", "bulk-read", "research", "implement", "second-opinion")
 EFFORTS = ("low", "medium", "high")
+KIRO_ENGINES = ("v1", "v2", "v3")
 
 DEFAULT_TIMEOUT_MIN = 30
 DEFAULT_STALL_MIN = 10
@@ -127,7 +128,7 @@ class _Sanitiser(object):
         elif models is not None:
             self.drop(where + ".models", models, "a list")
 
-        return {
+        out = {
             "enabled": True if enabled is None else enabled,
             "model": model,
             "effort": effort,
@@ -135,6 +136,13 @@ class _Sanitiser(object):
                                        TIMEOUT_MIN_BOUNDS, DEFAULT_TIMEOUT_MIN),
             "models": kept,
         }
+        if cli == "kiro":
+            engine = w.get("engine")
+            if engine is not None and engine not in KIRO_ENGINES:
+                self.drop(where + ".engine", engine, ", ".join(KIRO_ENGINES))
+                engine = None
+            out["engine"] = engine
+        return out
 
     def routing(self, routing):
         if routing is None:
@@ -238,6 +246,9 @@ def _validate_worker(cli, w):
     timeout_min = w.get("timeout_min")
     if timeout_min is not None and not _in_bounds(timeout_min, TIMEOUT_MIN_BOUNDS):
         errors.append("workers.{}.timeout_min: must be {}..{}".format(cli, *TIMEOUT_MIN_BOUNDS))
+    engine = w.get("engine")
+    if engine is not None and (cli != "kiro" or engine not in KIRO_ENGINES):
+        errors.append("workers.{}.engine: kiro only, must be {} or null".format(cli, ", ".join(KIRO_ENGINES)))
     return errors
 
 

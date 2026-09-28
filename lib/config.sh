@@ -31,6 +31,7 @@ cfg_valid_model() { # value
   [[ "$1" =~ ^[][A-Za-z0-9._:/=-]+$ ]]
 }
 cfg_valid_effort() { case "$1" in low|medium|high) return 0 ;; esac; return 1; }
+cfg_valid_kiro_engine() { case "$1" in v1|v2|v3) return 0 ;; esac; return 1; }
 cfg_valid_int_range() { # value min max
   case "$1" in ''|*[!0-9]*) return 1 ;; esac
   [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]
@@ -61,6 +62,7 @@ cfg_worker() {
     enabled) [ "$t" = boolean ] && ok=true || ok=false ;;
     model) [ "$t" = string ] && cfg_valid_model "$v" && ok=true || ok=false ;;
     effort) [ "$t" = string ] && cfg_valid_effort "$v" && ok=true || ok=false ;;
+    engine) [ "$1" = kiro ] && [ "$t" = string ] && cfg_valid_kiro_engine "$v" && ok=true || ok=false ;;
     timeout_min) _cfg_int_ok "$t" "$v" 1 "$TIMEOUT_MIN_MAX" && ok=true || ok=false ;;
     *) ok=true ;;
   esac

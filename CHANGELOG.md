@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.2 - 2026-09-28
+
+- `workers.kiro.engine` config key (`v1`, `v2`, `v3`; default `v2`) picks
+  the engine kiro jobs run on, recorded per job as `engine` in meta.json.
+  The arcade's SETUP screen keeps it on save.
+- Kiro's v3 engine emits the same stream-json envelope, so results, partials
+  and stall detection work unchanged. It sends no metering events, so the
+  arcade credit counter stays empty for v3 jobs.
+- The arcade replay skips v3's kind-less housekeeping tool calls.
+
 ## 1.0.1 - 2026-09-24
 
 - `farmout status <id>` answers `queued` for a job waiting with `--queue`
