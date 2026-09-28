@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- The arcade no longer drops to NO SIGNAL under heavy load. `/api/state`
+  is built on a background thread and a poll waits at most 1 s for a fresh
+  build, then gets the last good one, so its latency no longer grows with
+  the number of jobs, log size or a disk busy with the workers' builds.
+  The first poll after start shows WARMING UP; a build still running after
+  10 s shows as `STATE NS BEHIND` next to the hall of fame.
+
 - The arcade's LAND / DISCARD confirm no longer hides its buttons on a job
   with many files: the file list scrolls inside a dialog capped to the
   window, so DISCARD / CONFIRM LAND / CANCEL stay on screen.

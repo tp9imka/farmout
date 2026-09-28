@@ -49,7 +49,7 @@ class App extends Component {
   constructor() {
     super();
     this.state = {
-      data: null, fails: 0, lastErr: '', f: 0, sound: false, screen: 'cabinet', focusId: null, page: 0, rpp: 2, px: 5,
+      data: null, warming: false, fails: 0, lastErr: '', f: 0, sound: false, screen: 'cabinet', focusId: null, page: 0, rpp: 2, px: 5,
       confirm: null, busy: false, actionMsg: null, saving: false,
       saved: null, draft: null, etag: null, cfgStale: false, cfgErr: null, tab: 'workers', savedNote: 'ALL CHANGES SAVED',
       doctor: null, checking: false, lastCheck: null, view: 'play', bench: loadBench(),
@@ -92,10 +92,12 @@ class App extends Component {
   async poll() {
     try {
       const { r, body: data } = await api('/api/state');
+      // The server's first build is still running: alive, just no board yet.
+      if (r.status === 503 && data && data.warming) { this.setState({ warming: true, fails: 0, lastErr: '' }); return; }
       if (!r.ok || !data) throw new Error(r.ok ? 'BAD JSON' : `HTTP ${r.status}`);
       this.setState(s => {
         const lost = s.screen === 'focus' && !findRecord(data, s.focusId);
-        return { data, fails: 0, lastErr: '', ...(lost ? { screen: 'cabinet', focusId: null, confirm: null } : {}) };
+        return { data, warming: false, fails: 0, lastErr: '', ...(lost ? { screen: 'cabinet', focusId: null, confirm: null } : {}) };
       });
     } catch (e) {
       this.setState(s => ({ fails: s.fails + 1, lastErr: errText(e) }));
@@ -223,6 +225,7 @@ class App extends Component {
       }));
       body = html`<${Cabinet} v=${{
         dataLive: !noSignal && !!data && r.records > 0, dataEmpty: !noSignal && !!data && r.records === 0, noSignal,
+        warming: !noSignal && !data && S.warming, behind: data && data.behind_s > 0 ? `STATE ${data.behind_s}S BEHIND` : '',
         view: S.view, nPlay: r.nPlay, nBench: r.nBench, viewEmpty: r.total === 0,
         viewEmptyTitle: onBenchView ? 'BENCH IS EMPTY' : 'NOTHING IN PLAY',
         viewEmptyText: onBenchView ? 'Idle and ended sessions move here, and so does any tile you bench.' : 'Every session is on the bench.',

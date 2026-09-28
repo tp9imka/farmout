@@ -10,6 +10,7 @@ import argparse
 import hmac
 import http.server
 import json
+import math
 import mimetypes
 import os
 import re
@@ -34,6 +35,11 @@ KILL_REAP_TIMEOUT_S = 5
 HANDLER_TIMEOUT_S = 30
 LIVE_SESSION_STATUSES = ("play", "think", "turn", "idle")
 MAX_BODY_BYTES = 64 * 1024
+# How long /api/state waits for a fresh build before serving the last one.
+# Well under the page's 5 s poll timeout, whatever a build costs.
+STATE_WAIT_S = 1.0
+# A build still running after this long is reported as behind_s.
+STATE_BEHIND_AFTER_S = 10
 
 TOKEN_HEADER = "X-Arcade-Token"
 
@@ -41,7 +47,7 @@ JOB_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[a-z]+-[0-9a-f]{4}$")
 _JOB_ACTION_RE = re.compile(r"^/api/jobs/([^/]+)/(kill|land|discard)$")
 _SESSION_END_RE = re.compile(r"^/api/sessions/([^/]+)/end$")
 SESSION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-_STATE_KEYS = ("now", "stall_min", "machine", "errors", "hud", "sessions", "jobs", "hof")
+_STATE_KEYS = ("now", "stall_min", "machine", "errors", "hud", "sessions", "jobs", "hof", "behind_s")
 
 _EXTRA_CONTENT_TYPES = {".mjs": "text/javascript", ".woff2": "font/woff2", ".ttf": "font/ttf"}
 
@@ -121,14 +127,84 @@ class _JobLocks(object):
             lock.release()
 
 
+class StateBuilder(object):
+    """Builds /api/state on its own thread, one build at a time, on demand.
+
+    A request asks for a build that starts after it arrived and waits at most
+    wait_s for it; past that it gets the last good state. A poll's latency is
+    then bounded by wait_s however long a build takes (many jobs, big logs, a
+    disk busy with the workers' builds). Concurrent requests share one build.
+    """
+
+    def __init__(self, build, wait_s=STATE_WAIT_S):
+        self._build = build
+        self._wait_s = wait_s
+        self._cond = threading.Condition()
+        self._started = 0
+        self._done = 0
+        self._wanted = 0
+        self._building_since = None
+        self._state = None  # last good build
+        self._error = None  # exception type of the latest build, if it failed
+        self._closed = False
+        t = threading.Thread(target=self._loop, name="arcade-state")
+        t.daemon = True
+        t.start()
+
+    def close(self):
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+    def get(self):
+        """(state, error, fresh, behind_s). state is None until a build succeeds;
+        fresh means a build begun after this call finished in time."""
+        with self._cond:
+            target = self._started + 1
+            self._wanted = max(self._wanted, target)
+            self._cond.notify_all()
+            deadline = time.monotonic() + self._wait_s
+            while self._done < target and not self._closed:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                self._cond.wait(left)
+            since = self._building_since
+            behind = 0.0 if since is None else time.monotonic() - since
+            return self._state, self._error, self._done >= target, behind
+
+    def _loop(self):
+        while True:
+            with self._cond:
+                while not self._closed and self._wanted <= self._started:
+                    self._cond.wait()
+                if self._closed:
+                    return
+                self._started += 1
+                self._building_since = time.monotonic()
+            state, error = None, None
+            try:
+                state = self._build()
+            except Exception as exc:  # the builder must outlive one bad build
+                error = type(exc).__name__
+            with self._cond:
+                if state is not None:
+                    self._state = state
+                self._error = error
+                self._done = self._started
+                self._building_since = None
+                self._cond.notify_all()
+
+
 class ArcadeHTTPServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
     def __init__(self, addr, handler_cls, *, token, farmout_bin, farmout_home,
-                 claude_home, config_path, static_dir):
+                 claude_home, config_path, static_dir, state_wait_s=STATE_WAIT_S):
         # Before the bind: a failed bind calls server_close(), which closes it.
         self.jobs_model = model_jobs.JobsModel(farmout_home, background_files=True)
+        self.state_builder = StateBuilder(self.build_state, state_wait_s)
         super().__init__(addr, handler_cls)
         self.token = token
         self.farmout_bin = farmout_bin
@@ -137,12 +213,41 @@ class ArcadeHTTPServer(http.server.ThreadingHTTPServer):
         self.config_path = config_path
         self.static_dir = os.path.realpath(static_dir)
         self.sessions_model = model_sessions.SessionsModel(claude_home)
-        self.state_lock = threading.Lock()
         self.job_locks = _JobLocks()
 
     def server_close(self):
         self.jobs_model.close()
+        self.state_builder.close()
         super().server_close()
+
+    def build_state(self):
+        # Runs only on the StateBuilder thread, so the models see one caller.
+        now_ms = int(time.time() * 1000)
+        cfg, _, cfg_warnings = config.load_with_warnings(self.config_path)
+        stall_min = cfg["limits"]["stall_min"]
+        jobs_snap = self.jobs_model.snapshot(now_ms, stall_min)
+        sessions_snap = self.sessions_model.snapshot(
+            now_ms, jobs_snap["jobs"] + jobs_snap["hof"])
+        errors = (
+            jobs_snap["errors"]
+            + sessions_snap["errors"]
+            + ["config: " + w for w in cfg_warnings]
+            + ["config: " + e for e in config.validate(cfg)]
+        )
+        hud = compute_hud(sessions_snap["sessions"], jobs_snap["jobs"], jobs_snap["today"])
+        state = {
+            "now": now_ms,
+            "stall_min": stall_min,
+            "machine": _read_machine(),
+            "errors": errors,
+            "hud": hud,
+            "sessions": sessions_snap["sessions"],
+            "jobs": jobs_snap["jobs"],
+            "hof": jobs_snap["hof"],
+            "behind_s": 0,
+        }
+        assert set(state) == set(_STATE_KEYS)
+        return state
 
     def handle_error(self, request, client_address):
         # The stdlib default prints the full traceback (request included)
@@ -428,8 +533,8 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
     def _handle_session_end(self, session_id):
         # Sessions are otherwise watch-only: this only ever touches processes
         # that are both registered for this session and currently stopped.
-        # No state_lock: this reads the registry and ps only, and may wait
-        # seconds for the process to exit, which must not stall /api/state.
+        # Runs on the handler thread: it may wait seconds for the process
+        # to exit, and /api/state is served by the StateBuilder meanwhile.
         ended, survivors = self.server.sessions_model.end_suspended(session_id)
         if not ended and not survivors:
             self._json(409, {"ok": False, "err": "no suspended process for this session"})
@@ -440,49 +545,38 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
     # -- /api/state ---------------------------------------------------------
 
     def _handle_state(self):
-        try:
-            state = self._compute_state()
-        except Exception as exc:
-            # The type only: a message could carry paths or file content.
-            self._json(500, {"errors": ["state: {}".format(type(exc).__name__)]})
-            return
-        self._json(200, state)
-
-    def _compute_state(self):
         demo = getattr(self.server, "demo_state", None)
         if demo:
-            # --demo: a fixed sample board (README screenshots, a first look
-            # before any job exists). Nothing on this machine is read.
-            with open(demo, "r", encoding="utf-8") as f:
+            self._handle_demo_state(demo)
+            return
+        state, error, fresh, behind = self.server.state_builder.get()
+        # The type only: a message could carry paths or file content.
+        if error and (fresh or state is None):
+            self._json(500, {"errors": ["state: {}".format(error)]})
+            return
+        if state is None:
+            # The first build is still running. Not a failure: the page shows
+            # WARMING UP instead of counting it toward NO SIGNAL.
+            self._json(503, {"warming": True})
+            return
+        errors = list(state["errors"])
+        if error:
+            errors.append("state: {}".format(error))
+        behind_s = int(math.ceil(behind)) if behind >= STATE_BEHIND_AFTER_S else 0
+        self._json(200, dict(state, errors=errors, behind_s=behind_s))
+
+    def _handle_demo_state(self, path):
+        # --demo: a fixed sample board (README screenshots, a first look
+        # before any job exists). Nothing on this machine is read.
+        try:
+            with open(path, "r", encoding="utf-8") as f:
                 state = json.load(f)
-            state["now"] = int(time.time() * 1000)
-            return state
-        with self.server.state_lock:
-            now_ms = int(time.time() * 1000)
-            cfg, _, cfg_warnings = config.load_with_warnings(self.server.config_path)
-            stall_min = cfg["limits"]["stall_min"]
-            jobs_snap = self.server.jobs_model.snapshot(now_ms, stall_min)
-            sessions_snap = self.server.sessions_model.snapshot(
-                now_ms, jobs_snap["jobs"] + jobs_snap["hof"])
-            errors = (
-                jobs_snap["errors"]
-                + sessions_snap["errors"]
-                + ["config: " + w for w in cfg_warnings]
-                + ["config: " + e for e in config.validate(cfg)]
-            )
-            hud = compute_hud(sessions_snap["sessions"], jobs_snap["jobs"], jobs_snap["today"])
-            state = {
-                "now": now_ms,
-                "stall_min": stall_min,
-                "machine": _read_machine(),
-                "errors": errors,
-                "hud": hud,
-                "sessions": sessions_snap["sessions"],
-                "jobs": jobs_snap["jobs"],
-                "hof": jobs_snap["hof"],
-            }
-        assert set(state) == set(_STATE_KEYS)
-        return state
+        except Exception as exc:
+            self._json(500, {"errors": ["state: {}".format(type(exc).__name__)]})
+            return
+        state["now"] = int(time.time() * 1000)
+        state.setdefault("behind_s", 0)
+        self._json(200, state)
 
     # -- /api/config ---------------------------------------------------------
 
@@ -602,11 +696,13 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
         self._json(200, payload)
 
 
-def build_server(port, token, *, farmout_bin, farmout_home, claude_home, config_path, static_dir):
+def build_server(port, token, *, farmout_bin, farmout_home, claude_home, config_path, static_dir,
+                 state_wait_s=STATE_WAIT_S):
     return ArcadeHTTPServer(
         ("127.0.0.1", port), ArcadeHandler,
         token=token, farmout_bin=farmout_bin, farmout_home=farmout_home,
         claude_home=claude_home, config_path=config_path, static_dir=static_dir,
+        state_wait_s=state_wait_s,
     )
 
 

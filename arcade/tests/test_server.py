@@ -36,6 +36,9 @@ class _ServerTestCase(unittest.TestCase):
     """Boots a real ArcadeHTTPServer on an ephemeral port for each test."""
 
     static_ready = False
+    # Long enough that every GET sees a build begun after it, even on a
+    # loaded machine; StateBudgetTestCase runs with the real budget.
+    state_wait_s = 10.0
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="arcade-server-test-")
@@ -58,7 +61,7 @@ class _ServerTestCase(unittest.TestCase):
             0, self.token,
             farmout_bin=FAKE_FARMOUT, farmout_home=self.farmout_home,
             claude_home=self.claude_home, config_path=self.config_path,
-            static_dir=self.static_dir,
+            static_dir=self.static_dir, state_wait_s=self.state_wait_s,
         )
         self.port = self.srv.server_address[1]
         self.thread = threading.Thread(target=self.srv.serve_forever)
@@ -487,8 +490,9 @@ class StateSchemaTestCase(_ServerTestCase):
         self.assertEqual(200, resp.status)
         self.assertEqual(
             set(data.keys()),
-            {"now", "stall_min", "machine", "errors", "hud", "sessions", "jobs", "hof"},
+            {"now", "stall_min", "machine", "errors", "hud", "sessions", "jobs", "hof", "behind_s"},
         )
+        self.assertEqual(0, data["behind_s"])
         self.assertEqual(set(data["hud"].keys()), {"score", "live", "shown", "credits", "premium"})
         self.assertIsInstance(data["sessions"], list)
         self.assertIsInstance(data["jobs"], list)
@@ -637,6 +641,62 @@ class StateRobustnessTestCase(_ServerTestCase):
         self.assertEqual([done], [j["id"] for j in data["hof"]])
         self.assertEqual(1, len(data["sessions"]))
         self.assertEqual([done], data["sessions"][0]["crew"])
+
+
+class StateBudgetTestCase(_ServerTestCase):
+    """/api/state answers inside its wait budget however long a build takes."""
+
+    state_wait_s = server.STATE_WAIT_S
+    # The budget plus room for a loaded machine, still well under the page's 5 s.
+    ANSWER_WITHIN_S = server.STATE_WAIT_S + 1.5
+    SLOW_BUILD_S = 4
+
+    def _slow_snapshot(self, orig=None):
+        orig = orig or self.srv.jobs_model.snapshot
+
+        def slow(*args):
+            time.sleep(self.SLOW_BUILD_S)
+            return orig(*args)
+        return slow
+
+    def _timed_get(self):
+        started = time.monotonic()
+        resp, data = self._get("/api/state")
+        self.assertLess(time.monotonic() - started, self.ANSWER_WITHIN_S)
+        return resp, data
+
+    def _warm(self):
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            resp, data = self._get("/api/state")
+            if resp.status == 200:
+                return data
+        self.fail("state never warmed up")
+
+    def test_first_poll_during_a_slow_first_build_is_warming_not_a_timeout(self):
+        with mock.patch.object(self.srv.jobs_model, "snapshot", self._slow_snapshot()):
+            resp, data = self._timed_get()
+        self.assertEqual(503, resp.status)
+        self.assertEqual({"warming": True}, data)
+
+    def test_slow_build_serves_the_last_state_within_budget(self):
+        job_id = _job_id("a1b2")
+        self._write_job(job_id, _job_meta(job_id, sup_pid=os.getpid()))
+        before = self._warm()
+        self.assertEqual([job_id], [j["id"] for j in before["jobs"]])
+        with mock.patch.object(self.srv.jobs_model, "snapshot", self._slow_snapshot()):
+            for _ in range(3):
+                resp, data = self._timed_get()
+                self.assertEqual(200, resp.status)
+                self.assertEqual([job_id], [j["id"] for j in data["jobs"]])
+
+    def test_a_build_stuck_past_the_threshold_is_reported_as_behind(self):
+        self._warm()
+        with mock.patch.object(server, "STATE_BEHIND_AFTER_S", 0.5), \
+                mock.patch.object(self.srv.jobs_model, "snapshot", self._slow_snapshot()):
+            resp, data = self._timed_get()
+        self.assertEqual(200, resp.status)
+        self.assertGreaterEqual(data["behind_s"], 1)
 
 
 # -- /api/config ---------------------------------------------------------
