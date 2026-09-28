@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- The arcade's LAND / DISCARD confirm no longer hides its buttons on a job
+  with many files: the file list scrolls inside a dialog capped to the
+  window, so DISCARD / CONFIRM LAND / CANCEL stay on screen.
+
 ## 1.0.2 - 2026-09-28
 
 - `workers.kiro.engine` config key (`v1`, `v2`, `v3`; default `v2`) picks
