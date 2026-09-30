@@ -248,6 +248,57 @@ in_place_overlapping_jobs() { # jobdir ended-iso
   return 0
 }
 
+# Finished records are still attribution inputs for admitted peers. The
+# supervisor publishes its final status only after attribution, so running
+# peers need protection even after their .ended snapshot has been written.
+in_place_cleanup_guard() { # jobdir -> kept reason; nonzero means retain
+  local job="$1" meta d peer live sup checkout peer_checkout overlap
+  meta="$(jq -cse 'if length == 1 and (.[0] | type == "object") then .[0]
+    else error("invalid job metadata") end' "$job/meta.json" 2>/dev/null)" \
+    || { echo 'overlap evidence unreadable; retry clean when metadata is available'; return 2; }
+  live="$(printf '%s' "$meta" | jq -r '.admitted == true')" \
+    || { echo 'overlap evidence unreadable; retry clean when metadata is available'; return 2; }
+  [ "$live" = true ] || return 0
+  for d in "$FARMOUT_HOME"/jobs/*/; do
+    d="${d%/}"
+    [ "$d" != "$job" ] || continue
+    # A claim without metadata cannot yet be admitted.
+    [ -f "$d/meta.json" ] || continue
+    peer="$(jq -cse 'if length == 1 and (.[0] | type == "object") then .[0]
+      else error("invalid job metadata") end' "$d/meta.json" 2>/dev/null)" \
+      || { echo "overlap evidence unreadable for $(basename "$d"); retry clean when metadata is available"; return 2; }
+    live="$(printf '%s' "$peer" | jq -r '.mode == "in-place" and .admitted == true and .status == "running"')" \
+      || { echo "overlap evidence unreadable for $(basename "$d"); retry clean when metadata is available"; return 2; }
+    [ "$live" = true ] || continue
+    sup="$(printf '%s' "$peer" | jq -r '.sup_pid // empty')" \
+      || { echo "overlap evidence unreadable for $(basename "$d"); retry clean when metadata is available"; return 2; }
+    [ -n "$sup" ] && pid_alive "$sup" || continue
+    # In-place checkout paths are recorded Git toplevels. Resolve physical
+    # directories without inspecting Git or refreshing the live index.
+    checkout="$(printf '%s' "$meta" | jq -r '.checkout // .repo // empty')" \
+      && checkout="$(cd "$checkout" 2>/dev/null && pwd -P)" \
+      && peer_checkout="$(printf '%s' "$peer" | jq -r '.checkout // .repo // empty')" \
+      && peer_checkout="$(cd "$peer_checkout" 2>/dev/null && pwd -P)" \
+      || { echo "overlap checkout evidence unreadable for $(basename "$d"); retry clean when the checkout is available"; return 2; }
+    [ "$checkout" = "$peer_checkout" ] || continue
+    overlap="$(printf '%s' "$peer" | jq -r --argjson own "$meta" '
+      def timestamp: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
+      ($own.admitted_at // $own.started) as $start | $own.ended as $end |
+      (.admitted_at // .started) as $peer_start | .ended as $peer_end |
+      if ([$start,$end,$peer_start] | all(.[]; timestamp))
+        and ($peer_end == null or ($peer_end | timestamp))
+        and $start <= $end and ($peer_end == null or $peer_start <= $peer_end)
+      then $peer_start <= $end and ($peer_end == null or $peer_end >= $start)
+      else error("invalid attribution interval") end' 2>/dev/null)" \
+      || { echo "overlap interval evidence unreadable for $(basename "$d"); retry clean when metadata is available"; return 2; }
+    if [ "$overlap" = true ]; then
+      echo "attribution needed by live in-place job $(basename "$d"); retry clean after $(basename "$d") finishes"
+      return 1
+    fi
+  done
+  return 0
+}
+
 # Evaluate Git's complete pathspec set against the commit and its parents.
 # An absent private index prevents ls-files --with-tree from also matching
 # unrelated paths in the live index. Attribute pathspecs must also read their
@@ -1088,7 +1139,7 @@ IN_PLACE_BRIEF_PREAMBLE() { # source_branch owns...
   printf '%s\n' '# Ground rules (added by farmout)'
   printf -- "- Your working directory is the user's live checkout, on branch %s. Other agents may be working in this same checkout at the same time. It is not a copy: every change is real.\n" "$source_branch"
   printf '%s\n' "- You own only these paths: $paths. Edit nothing else. If the task needs a file outside them, stop and say so in your final message."
-  printf '%s\n' "- Commit your own paths by name: \`git add $paths\` then \`git commit -m \"<msg>\" -- $paths\`. Never \`git add -A\`, \`git add .\`, \`git add -u\` or \`git commit -a\`."
+  printf '%s\n' "- Commit your own paths by name: \`git add -- $paths\` then \`git commit -m \"<msg>\" -- $paths\`. Never \`git add -A\`, \`git add .\`, \`git add -u\` or \`git commit -a\`."
   printf '%s\n' '- Never `checkout`/`switch` a branch, `stash`, `reset`, `rebase`, `merge`, `pull`, `push`, `commit --amend`, `clean`, or `restore` a path you did not change. Leave other agents'"'"' uncommitted changes alone.'
   printf '%s\n' '- If git reports that `index.lock` exists, wait a few seconds and retry. Never delete the lock.'
   printf '%s\n\n' '- If this checkout does not match what the brief describes, stop and report that as your first finding.'
@@ -1251,14 +1302,32 @@ cmd_clean() {
     esac
     shift
   done
-  local d n=0 es mode land
+  local d n=0 es mode land kept_reason cleanup_meta sup result_read parent_session pgid
   for d in "$FARMOUT_HOME"/jobs/*/; do
     [ -f "$d/meta.json" ] || continue
     d="${d%/}"
-    [ -z "$mine" ] || [ "$(meta_get "$d" parent_session)" = "$mine" ] || continue
-    es="$(effective_status "$d")"
+    cleanup_meta="$(jq -cse 'if length == 1 and (.[0] | type == "object") then .[0]
+      else error("invalid job metadata") end' "$d/meta.json" 2>/dev/null)" || {
+      echo "kept $(basename "$d") (overlap evidence unreadable; retry clean when metadata is available)"
+      continue
+    }
+    es="$(printf '%s' "$cleanup_meta" | jq -r '.status // empty')" \
+      && mode="$(printf '%s' "$cleanup_meta" | jq -r '.mode // empty')" \
+      && land="$(printf '%s' "$cleanup_meta" | jq -r '.land // empty')" \
+      && sup="$(printf '%s' "$cleanup_meta" | jq -r '.sup_pid // empty')" \
+      && result_read="$(printf '%s' "$cleanup_meta" | jq -r '.result_read // false')" \
+      && parent_session="$(printf '%s' "$cleanup_meta" | jq -r '.parent_session // empty')" \
+      && pgid="$(printf '%s' "$cleanup_meta" | jq -r '.pgid // empty')" || {
+      echo "kept $(basename "$d") (overlap evidence unreadable; retry clean when metadata is available)"
+      continue
+    }
+    [ -z "$mine" ] || [ "$parent_session" = "$mine" ] || continue
+    if [ "$es" = running ] && { [ -z "$sup" ] || ! pid_alive "$sup"; }; then es=lost; fi
     [ "$es" = running ] && continue
-    mode="$(meta_get "$d" mode)"; land="$(meta_get "$d" land)"
+    if [ "$mode" = in-place ] && ! kept_reason="$(in_place_cleanup_guard "$d")"; then
+      echo "kept $(basename "$d") ($kept_reason)"
+      continue
+    fi
     # Successful lanes hold unreviewed work. Non-ok in-place records use the
     # shared unread-result rule below, including failed/killed/empty/rate-limited.
     if ! $all && [ "$es" = ok ]; then
@@ -1270,7 +1339,7 @@ cmd_clean() {
           fi
           ;;
         in-place)
-          if jq -e '.land == null' "$d/meta.json" >/dev/null; then
+          if printf '%s' "$cleanup_meta" | jq -e '.land == null' >/dev/null; then
             echo "kept $(basename "$d") (unaccepted in-place job; farmout accept $(basename "$d"); or use --all)"
             continue
           fi
@@ -1278,12 +1347,12 @@ cmd_clean() {
         read) ;;
       esac
     fi
-    if ! $all && [ "$(meta_get "$d" result_read)" != true ] && [ "$es" != lost ] \
+    if ! $all && [ "$result_read" != true ] && [ "$es" != lost ] \
        && { grep -q '[^[:space:]]' "$d/result.md" 2>/dev/null || [ -n "$(adapter_partial "$(meta_get "$d" cli)" "$d")" ]; }; then
       echo "kept $(basename "$d") (result never read: farmout result $(basename "$d"); or use --all)"
       continue
     fi
-    [ "$es" = lost ] && kill_group "$(meta_get "$d" pgid)"
+    [ "$es" = lost ] && kill_group "$pgid"
     case "$mode" in
       in-place) ;; # Only the record is ours; the checkout and branch are not.
       read|write) remove_worktree "$d" ;;

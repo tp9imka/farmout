@@ -435,6 +435,123 @@ test_in_place_attribution_two_lanes() {
   assert_eq "$(jq -c '[.commits[].shared]' "$FARMOUT_HOME/jobs/second/meta.json")" '[false]'
 }
 
+assert_clean_preserves_in_place_attribution() { # optional --all
+  make_feature_branch; configure_in_place_author; track_in_place_paths
+  start_attribution_lane first a.txt a.txt; local first="$ATTRIBUTION_RUNNER"
+  start_attribution_lane second dir/b.txt dir/b.txt; local second="$ATTRIBUTION_RUNNER"
+  release_attribution_lane first; local first_sha second_sha output
+  first_sha="$(git -C "$REPO" rev-parse HEAD)"
+  finish_attribution_lane first "$first"
+  "$FARMOUT" result first >/dev/null; "$FARMOUT" accept first >/dev/null
+  assert_eq "$(meta second admitted)" true; assert_eq "$(meta second status)" running
+  cp -R "$FARMOUT_HOME/jobs/first" "$T/first-before-clean"
+  lifecycle_git_snapshot "$REPO" "$T/git-before-clean"
+  output="$("$FARMOUT" clean ${1:+"$1"})"
+  [ -d "$FARMOUT_HOME/jobs/first" ] || fail 'clean removed attribution evidence while second was running'
+  assert_contains "$output" 'attribution needed by live in-place job second'
+  assert_contains "$output" 'retry clean after second finishes'
+  assert_contains "$output" 'removed 0 job(s)'
+  diff -r "$T/first-before-clean" "$FARMOUT_HOME/jobs/first" || fail 'retention changed first record'
+  lifecycle_git_snapshot "$REPO" "$T/git-after-clean"
+  diff -r "$T/git-before-clean" "$T/git-after-clean" || fail 'clean changed checkout/index/worktrees'
+  release_attribution_lane second; second_sha="$(git -C "$REPO" rev-parse HEAD)"
+  finish_attribution_lane second "$second"
+  assert_eq "$(jq -c '[.commits[].sha]' "$FARMOUT_HOME/jobs/second/meta.json")" "[\"$second_sha\"]"
+  assert_eq "$(jq -c '[.outside_owns,.unattributed]' "$FARMOUT_HOME/jobs/second/meta.json")" '[[],[]]'
+  assert_eq "$(jq -c '[.commits[].sha]' "$FARMOUT_HOME/jobs/first/meta.json")" "[\"$first_sha\"]"
+  output="$("$FARMOUT" clean)"
+  assert_contains "$output" 'removed 1 job(s)'
+  [ ! -d "$FARMOUT_HOME/jobs/first" ] || fail 'clean kept first after second finalized'
+  [ -d "$FARMOUT_HOME/jobs/second" ] || fail 'clean removed unaccepted second record'
+}
+
+test_clean_preserves_in_place_attribution() { assert_clean_preserves_in_place_attribution; }
+test_clean_all_preserves_in_place_attribution() { assert_clean_preserves_in_place_attribution --all; }
+
+cleanup_overlap_records() {
+  lifecycle_record candidate in-place ok '"accepted"'
+  lifecycle_record z-peer in-place running
+  jq '.started = "2026-09-30T12:00:00Z" | .admitted_at = .started | .ended = "2026-09-30T12:00:10Z"' \
+    "$FARMOUT_HOME/jobs/candidate/meta.json" > "$T/meta"
+  mv "$T/meta" "$FARMOUT_HOME/jobs/candidate/meta.json"
+  jq '.started = "2026-09-30T12:00:05Z" | .admitted_at = .started | .ended = null' \
+    "$FARMOUT_HOME/jobs/z-peer/meta.json" > "$T/meta"
+  mv "$T/meta" "$FARMOUT_HOME/jobs/z-peer/meta.json"
+}
+
+test_clean_retains_unreadable_in_place_overlap_evidence() {
+  prepare_lifecycle_checkout; cleanup_overlap_records
+  printf 'incomplete metadata\n' > "$FARMOUT_HOME/jobs/z-peer/meta.json"
+  cp -R "$FARMOUT_HOME/jobs" "$T/expected-records"
+  lifecycle_snapshot "$T/before"
+  run_lifecycle clean --all
+  assert_eq "$RC" 0 "$ERR"; assert_contains "$OUT" 'overlap evidence unreadable'
+  assert_contains "$OUT" 'retry clean when metadata is available'
+  diff -r "$T/expected-records" "$FARMOUT_HOME/jobs" || fail 'clean removed unreadable overlap evidence'
+  assert_lifecycle_git_unchanged "$T/before"
+}
+
+test_clean_retains_finalizing_in_place_peer() {
+  prepare_lifecycle_checkout; cleanup_overlap_records
+  ln -s "$REPO" "$T/checkout-alias"
+  jq --arg checkout "$T/checkout-alias" '.checkout = $checkout | .ended = "2026-09-30T12:00:08Z"' \
+    "$FARMOUT_HOME/jobs/z-peer/meta.json" > "$T/meta"
+  mv "$T/meta" "$FARMOUT_HOME/jobs/z-peer/meta.json"
+  jq '.land = null | .result_read = false' "$FARMOUT_HOME/jobs/candidate/meta.json" > "$T/meta"
+  mv "$T/meta" "$FARMOUT_HOME/jobs/candidate/meta.json"
+  cp -R "$FARMOUT_HOME/jobs" "$T/expected-records"
+  lifecycle_snapshot "$T/before"
+  run_lifecycle clean --all
+  assert_eq "$RC" 0 "$ERR"; assert_contains "$OUT" 'attribution needed by live in-place job z-peer'
+  diff -r "$T/expected-records" "$FARMOUT_HOME/jobs" || fail 'clean removed evidence during finalization'
+  assert_lifecycle_git_unchanged "$T/before"
+}
+
+test_clean_retention_ignores_ineligible_peers() {
+  prepare_lifecycle_checkout; lifecycle_snapshot "$T/before"
+  local scenario filter
+  for scenario in queued unadmitted ended lost non-overlapping linked reader writer; do
+    cleanup_overlap_records
+    case "$scenario" in
+      queued) filter='.status = "queued" | .admitted = false' ;;
+      unadmitted) filter='.admitted = false' ;;
+      ended) filter='.status = "ok" | .ended = "2026-09-30T12:00:08Z"' ;;
+      lost) filter='.sup_pid = 99999999' ;;
+      non-overlapping) filter='.admitted_at = "2026-09-30T12:00:11Z"' ;;
+      linked) filter='.checkout = $linked' ;;
+      reader) filter='.mode = "read"' ;;
+      writer) filter='.mode = "write"' ;;
+    esac
+    jq --arg linked "$T/lifecycle-linked" "$filter" "$FARMOUT_HOME/jobs/z-peer/meta.json" > "$T/meta"
+    mv "$T/meta" "$FARMOUT_HOME/jobs/z-peer/meta.json"
+    run_lifecycle clean --all
+    assert_eq "$RC" 0 "$scenario: $ERR"
+    [ ! -d "$FARMOUT_HOME/jobs/candidate" ] || fail "retained candidate for $scenario peer"
+    assert_lifecycle_git_unchanged "$T/before"
+    rm -rf "$FARMOUT_HOME/jobs/z-peer"
+  done
+}
+
+test_clean_retains_unreliable_in_place_intervals() {
+  prepare_lifecycle_checkout; lifecycle_snapshot "$T/before"
+  local scenario filter
+  for scenario in interval checkout; do
+    cleanup_overlap_records
+    case "$scenario" in
+      interval) filter='.admitted_at = null | .started = null' ;;
+      checkout) filter='.checkout = "/missing/farmout-checkout"' ;;
+    esac
+    jq "$filter" "$FARMOUT_HOME/jobs/z-peer/meta.json" > "$T/meta"
+    mv "$T/meta" "$FARMOUT_HOME/jobs/z-peer/meta.json"
+    cp -R "$FARMOUT_HOME/jobs" "$T/expected-$scenario"
+    run_lifecycle clean --all
+    assert_eq "$RC" 0 "$ERR"; assert_contains "$OUT" 'evidence unreadable'
+    assert_contains "$OUT" 'retry clean'
+    diff -r "$T/expected-$scenario" "$FARMOUT_HOME/jobs" || fail "removed $scenario evidence"
+    assert_lifecycle_git_unchanged "$T/before"
+  done
+}
+
 test_in_place_shared_commit_attributed_to_each_lane() {
   make_feature_branch; configure_in_place_author; track_in_place_paths
   start_attribution_lane first a.txt; local first="$ATTRIBUTION_RUNNER"
@@ -1126,14 +1243,14 @@ test_in_place_brief_verbatim() {
   local r="$FARMOUT_HOME/jobs/$ID/brief.md"
   head -1 "$r" | grep -q '^# Ground rules (added by farmout)' || fail 'ground rules missing'
   assert_contains "$(cat "$r")" "user's live checkout, on branch feature/in-place-test"
-  assert_contains "$(cat "$r")" 'git add a.txt space\ file.txt'
+  assert_contains "$(cat "$r")" 'git add -- a.txt space\ file.txt'
   assert_contains "$(cat "$r")" 'Never delete the lock.'
   assert_eq "$(grep -c '^- ' "$r")" 6
   local expected; expected="$(cat <<'EOF'
 # Ground rules (added by farmout)
 - Your working directory is the user's live checkout, on branch feature/in-place-test. Other agents may be working in this same checkout at the same time. It is not a copy: every change is real.
 - You own only these paths: a.txt space\ file.txt. Edit nothing else. If the task needs a file outside them, stop and say so in your final message.
-- Commit your own paths by name: `git add a.txt space\ file.txt` then `git commit -m "<msg>" -- a.txt space\ file.txt`. Never `git add -A`, `git add .`, `git add -u` or `git commit -a`.
+- Commit your own paths by name: `git add -- a.txt space\ file.txt` then `git commit -m "<msg>" -- a.txt space\ file.txt`. Never `git add -A`, `git add .`, `git add -u` or `git commit -a`.
 - Never `checkout`/`switch` a branch, `stash`, `reset`, `rebase`, `merge`, `pull`, `push`, `commit --amend`, `clean`, or `restore` a path you did not change. Leave other agents' uncommitted changes alone.
 - If git reports that `index.lock` exists, wait a few seconds and retry. Never delete the lock.
 - If this checkout does not match what the brief describes, stop and report that as your first finding.
@@ -1145,6 +1262,28 @@ EOF
   cmp -s <(cat "$r"; printf '\n') "$FARMOUT_HOME/jobs/$ID/result.md" \
     || fail 'actual worker brief argument lost trailing blank lines'
 }
+
+assert_in_place_brief_leading_dash_path() { # owned pathspec
+  make_feature_branch; brief 'FAKE: print done'
+  local p="$1" expected r
+  run_job fake --in-place --owns "$p" --owns 'space file.txt'
+  assert_eq "$RC" 0 "$ERR"
+  r="$FARMOUT_HOME/jobs/$ID/brief.md"
+  expected="$(cat <<EOF
+# Ground rules (added by farmout)
+- Your working directory is the user's live checkout, on branch feature/in-place-test. Other agents may be working in this same checkout at the same time. It is not a copy: every change is real.
+- You own only these paths: $p space\\ file.txt. Edit nothing else. If the task needs a file outside them, stop and say so in your final message.
+- Commit your own paths by name: \`git add -- $p space\\ file.txt\` then \`git commit -m "<msg>" -- $p space\\ file.txt\`. Never \`git add -A\`, \`git add .\`, \`git add -u\` or \`git commit -a\`.
+- Never \`checkout\`/\`switch\` a branch, \`stash\`, \`reset\`, \`rebase\`, \`merge\`, \`pull\`, \`push\`, \`commit --amend\`, \`clean\`, or \`restore\` a path you did not change. Leave other agents' uncommitted changes alone.
+- If git reports that \`index.lock\` exists, wait a few seconds and retry. Never delete the lock.
+- If this checkout does not match what the brief describes, stop and report that as your first finding.
+EOF
+)"
+  assert_eq "$(head -7 "$r")" "$expected" "$p exact-preamble"
+}
+
+test_in_place_brief_leading_dash_all_option() { assert_in_place_brief_leading_dash_path -A; }
+test_in_place_brief_leading_dash_filename() { assert_in_place_brief_leading_dash_path -odd.txt; }
 
 test_in_place_owns_must_be_repo_relative() {
   make_feature_branch; brief 'FAKE: print ok'

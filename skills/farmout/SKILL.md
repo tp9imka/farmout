@@ -271,7 +271,7 @@ constraint with these runtime rules, filling in explicit owned filenames:
 ```markdown
 # Constraints
 - You own only these paths: <owns...>. Edit nothing else. If the task needs a file outside them, stop and say so in your final message.
-- Commit your own paths by name: `git add <paths>` then `git commit -m "<msg>" -- <paths>`. Never `git add -A`, `git add .`, `git add -u` or `git commit -a`.
+- Commit your own paths by name: `git add -- <paths>` then `git commit -m "<msg>" -- <paths>`. Never `git add -A`, `git add .`, `git add -u` or `git commit -a`.
 - Never `checkout`/`switch` a branch, `stash`, `reset`, `rebase`, `merge`, `pull`, `push`, `commit --amend`, `clean`, or `restore` a path you did not change. Leave other agents' uncommitted changes alone.
 - If git reports that `index.lock` exists, wait a few seconds and retry. Never delete the lock.
 - If this checkout does not match what the brief describes, stop and report that as your first finding.
