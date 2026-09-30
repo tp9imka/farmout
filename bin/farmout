@@ -103,16 +103,22 @@ remove_worktree() { # jobdir
 in_place_preflight() { # repo source_branch allow_default owns...
   local repo="$1" source_branch="$2" allow_default="$3"
   shift 3
-  [ -n "$source_branch" ] || { echo 'farmout: --in-place refuses detached HEAD; check out a branch first' >&2; return 2; }
+  local current_branch
+  current_branch="$(GIT_OPTIONAL_LOCKS=0 git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null)"
+  [ -n "$current_branch" ] || { echo 'farmout: --in-place refuses detached HEAD; check out a branch first' >&2; return 2; }
   local default_branch
-  default_branch="$(git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)"
+  default_branch="$(GIT_OPTIONAL_LOCKS=0 git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)"
   default_branch="${default_branch#origin/}"
   if [ -z "$default_branch" ]; then
-    git -C "$repo" show-ref --verify --quiet refs/heads/main && default_branch=main
-    [ -n "$default_branch" ] || { git -C "$repo" show-ref --verify --quiet refs/heads/master && default_branch=master; }
+    GIT_OPTIONAL_LOCKS=0 git -C "$repo" show-ref --verify --quiet refs/heads/main && default_branch=main
+    [ -n "$default_branch" ] || { GIT_OPTIONAL_LOCKS=0 git -C "$repo" show-ref --verify --quiet refs/heads/master && default_branch=master; }
   fi
-  if [ "$source_branch" = "$default_branch" ] && [ "$allow_default" != true ]; then
-    echo "farmout: --in-place refuses default branch '$source_branch'; use a feature branch or --allow-default-branch" >&2
+  if [ "$current_branch" = "$default_branch" ] && [ "$allow_default" != true ]; then
+    echo "farmout: --in-place refuses default branch '$current_branch'; use a feature branch or --allow-default-branch" >&2
+    return 2
+  fi
+  if [ "$current_branch" != "$source_branch" ]; then
+    echo "farmout: checkout is no longer on recorded source branch '$source_branch' (now '$current_branch'); refusing admission" >&2
     return 2
   fi
   local dirty
@@ -122,6 +128,81 @@ in_place_preflight() { # repo source_branch allow_default owns...
     return 2
   fi
   return 0
+}
+
+canonical_checkout() { # checkout path -> physical Git toplevel
+  local top
+  top="$(GIT_OPTIONAL_LOCKS=0 git -C "$1" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  (cd "$top" && pwd -P)
+}
+
+# Sorted, unique, NUL-delimited tracked paths. Git interprets the pathspecs as
+# one set (including excludes/magic); Perl sorts records without losing newlines.
+owned_files() ( # repo treeish-or-empty pathspec...
+  local repo="$1" treeish="$2"
+  shift 2
+  set -o pipefail
+  if [ -n "$treeish" ]; then
+    GIT_OPTIONAL_LOCKS=0 git -C "$repo" ls-files -z --with-tree="$treeish" -- "$@"
+  else
+    GIT_OPTIONAL_LOCKS=0 git -C "$repo" ls-files -z -- "$@"
+  fi | perl -0ne '$paths{$_}=1; END { print sort keys %paths }'
+)
+
+owned_files_json() ( # repo owns-json
+  local repo="$1" owns_json="$2" path paths=()
+  while IFS= read -r -d '' path; do paths+=("$path"); done \
+    < <(printf '%s' "$owns_json" | jq -j '.[] | ., "\u0000"')
+  set -o pipefail
+  owned_files "$repo" '' "${paths[@]}" | jq -Rs 'split("\u0000") | .[:-1]'
+)
+
+# Return 2 for a live admitted owner, 3 for a live claimed owner. Claimed
+# overlap is contention, retried by admission, so simultaneous launches cannot
+# both check before either flips admitted:true. Launch preflight checks only
+# admitted owners; its caller has not claimed a visible record yet.
+in_place_overlap_guard() { # id repo owns-json [admitted-only]
+  local id="$1" repo="$2" owns_json="$3" admitted_only="${4:-false}"
+  local d other meta peer_checkout admitted status sup candidate peer_files
+  repo="$(canonical_checkout "$repo")" || { echo 'farmout: could not resolve checkout for ownership check' >&2; return 2; }
+  candidate="$(owned_files_json "$repo" "$owns_json")" || { echo 'farmout: could not enumerate owned paths' >&2; return 2; }
+  for d in "$FARMOUT_HOME"/jobs/*/; do
+    [ -f "$d/meta.json" ] || continue
+    d="${d%/}"; other="$(basename "$d")"
+    [ "$other" != "$id" ] || continue
+    meta="$(cat "$d/meta.json" 2>/dev/null)"
+    [ "$(printf '%s' "$meta" | jq -r '.mode // empty' 2>/dev/null)" = in-place ] || continue
+    admitted="$(printf '%s' "$meta" | jq -r '.admitted // false')"
+    status="$(printf '%s' "$meta" | jq -r '.status // empty')"
+    sup="$(printf '%s' "$meta" | jq -r '.sup_pid // empty')"
+    [ "$status" = running ] && [ -n "$sup" ] && pid_alive "$sup" || continue
+    [ "$admitted" = true ] || [ "$admitted_only" != admitted-only ] || continue
+    peer_checkout="$(printf '%s' "$meta" | jq -r '.checkout // .repo // empty')"
+    [ -n "$peer_checkout" ] || continue
+    peer_checkout="$(canonical_checkout "$peer_checkout")" || continue
+    [ "$peer_checkout" = "$repo" ] || continue
+    peer_files="$(owned_files_json "$repo" "$(printf '%s' "$meta" | jq -c '.owns')")" \
+      || { echo "farmout: could not enumerate ownership for job $other" >&2; return 2; }
+    if printf '%s' "$candidate" | jq -e --argjson peer "$peer_files" 'any(.[]; . as $p | $peer | index($p) != null)' >/dev/null; then
+      if [ "$admitted" != true ]; then
+        echo "farmout: waiting for overlapping claimed job $other" >&2
+        return 3
+      fi
+      echo "farmout: ownership overlaps live in-place job $other; overlap through untracked-only future files cannot be detected" >&2
+      return 2
+    fi
+  done
+  return 0
+}
+
+in_place_admission_guard() { # jobdir
+  local job="$1" repo source_branch allow_default path owns_json owns=()
+  repo="$(meta_get "$job" checkout)"; source_branch="$(meta_get "$job" source_branch)"
+  allow_default="$(meta_get "$job" allow_default_branch)"; owns_json="$(meta_get "$job" owns)"
+  while IFS= read -r -d '' path; do owns+=("$path"); done \
+    < <(printf '%s' "$owns_json" | jq -j '.[] | ., "\u0000"')
+  in_place_preflight "$repo" "$source_branch" "$allow_default" "${owns[@]}" || return 2
+  in_place_overlap_guard "$(basename "$job")" "$repo" "$owns_json"
 }
 
 make_scratch_repo() {
@@ -167,7 +248,9 @@ route_auto() { # kind
 # arrival order (found in T2 review) - counting live peers instead of
 # comparing ids removes the dependency on that order entirely.
 #
-# Scans every OTHER job dir and prints two numbers, "overall running":
+# Scans every OTHER job dir and prints four numbers:
+# "overall running checkout_overall checkout_running". The checkout pair
+# applies the same claimed-but-unadmitted rule to in-place jobs in this checkout.
 #   overall = admitted jobs whose effective status is running
 #           + unadmitted jobs whose sup_pid is alive
 #           + dirs with an unparsable meta.json (counted, to be safe)
@@ -176,8 +259,9 @@ route_auto() { # kind
 #             fast-reject, only push this job into a retry).
 # Dirs with no meta.json yet are ignored: their owner writes its meta before
 # its own scan, so a later scan here will count it once it exists.
-admission_scan() { # id
-  local id="$1" d other meta admitted status sup overall=0 running=0
+admission_scan() { # id [canonical checkout]
+  local id="$1" checkout="${2:-}" d other meta admitted status sup overall=0 running=0
+  local checkout_overall=0 checkout_running=0 same_checkout peer_checkout counted
   for d in "$FARMOUT_HOME"/jobs/*/; do
     [ -d "$d" ] || continue
     d="${d%/}"; other="$(basename "$d")"
@@ -189,18 +273,31 @@ admission_scan() { # id
       continue
     fi
     admitted="$(printf '%s' "$meta" | jq -r '.admitted // false')"
+    same_checkout=false
+    if [ -n "$checkout" ] && [ "$(printf '%s' "$meta" | jq -r '.mode // empty')" = in-place ]; then
+      peer_checkout="$(printf '%s' "$meta" | jq -r '.checkout // .repo // empty')"
+      [ -z "$peer_checkout" ] || peer_checkout="$(canonical_checkout "$peer_checkout")"
+      [ "$peer_checkout" != "$checkout" ] || same_checkout=true
+    fi
+    counted=false
     if [ "$admitted" = true ]; then
-      [ "$(effective_status "$d")" = running ] && { overall=$((overall + 1)); running=$((running + 1)); }
+      if [ "$(effective_status "$d")" = running ]; then
+        overall=$((overall + 1)); running=$((running + 1)); counted=true
+        $same_checkout && checkout_running=$((checkout_running + 1))
+      fi
     else
       # An old meta with no "admitted" field lands here too. Its status must
       # be "running" as well as its sup_pid alive - a finished job whose
       # sup_pid was since reused by an unrelated live process must not block.
       status="$(printf '%s' "$meta" | jq -r '.status // empty')"
       sup="$(printf '%s' "$meta" | jq -r '.sup_pid // empty')"
-      [ "$status" = running ] && [ -n "$sup" ] && pid_alive "$sup" && overall=$((overall + 1))
+      if [ "$status" = running ] && [ -n "$sup" ] && pid_alive "$sup"; then
+        overall=$((overall + 1)); counted=true
+      fi
     fi
+    $same_checkout && $counted && checkout_overall=$((checkout_overall + 1))
   done
-  echo "$overall $running"
+  echo "$overall $running $checkout_overall $checkout_running"
 }
 
 # Test-only: blocks between deciding to admit and flipping admitted:true, so
@@ -211,6 +308,7 @@ admit_test_pause() {
   [ -n "${FARMOUT_TEST_ADMIT_PAUSE:-}" ] || return 0
   : > "${FARMOUT_TEST_ADMIT_PAUSE}.paused"
   read -r _ < "$FARMOUT_TEST_ADMIT_PAUSE" 2>/dev/null
+  FARMOUT_TEST_ADMIT_PAUSE=""
 }
 
 admit_jitter() { awk -v r="$RANDOM" -v m="$ADMIT_JITTER_MAX_S" 'BEGIN{printf "%.3f", (r % 1000) / 1000 * m}'; }
@@ -243,6 +341,9 @@ admit_queued() { # id job max_jobs meta_json
       if ADMIT_RETURN_FULL=true admit_job "$id" "$job" "$max" "$meta_json"; then
         rm -f "$ticket"; trap - EXIT
         return 0
+      else
+        local rc=$?
+        [ "$rc" != 2 ] || { rm -f "$ticket"; trap - EXIT; exit 2; }
       fi
     fi
     $announced || { echo "farmout: queued $id for a slot (max $max concurrent jobs)" >&2; announced=true; }
@@ -261,29 +362,53 @@ admit_queued() { # id job max_jobs meta_json
 # under the limit.
 admit_job() { # id job max_jobs meta_json
   local id="$1" job="$2" max="$3" meta_json="$4" attempt=1 scan overall running
+  local checkout="" checkout_overall checkout_running in_place_max guard_rc=0
+  if [ "$(printf '%s' "$meta_json" | jq -r .mode)" = in-place ]; then
+    checkout="$(canonical_checkout "$(printf '%s' "$meta_json" | jq -r .checkout)")" \
+      || { rm -rf "$job"; die 'could not resolve checkout at admission'; }
+  fi
+  in_place_max="$(cfg_limit in_place_max)"; [ -n "$in_place_max" ] || in_place_max="$DEFAULT_IN_PLACE_MAX"
   while :; do
     meta_write "$job" "$meta_json"
 
-    scan="$(admission_scan "$id")"
-    overall="${scan% *}"; running="${scan#* }"
+    scan="$(admission_scan "$id" "$checkout")"
+    read -r overall running checkout_overall checkout_running <<< "$scan"
 
-    if [ "$overall" -lt "$max" ]; then
+    guard_rc=0
+    if [ "$overall" -lt "$max" ] && { [ -z "$checkout" ] || [ "$checkout_overall" -lt "$in_place_max" ]; }; then
       admit_test_pause
-      if [ "$(meta_get "$job" mode)" = in-place ]; then
+      if [ -n "$checkout" ]; then
+        in_place_admission_guard "$job" || guard_rc=$?
+        if [ "$guard_rc" = 2 ]; then rm -rf "$job"; return 2; fi
+      fi
+      if [ "$guard_rc" = 0 ] && [ -n "$checkout" ]; then
         local admission_head
-        admission_head="$(git -C "$(meta_get "$job" checkout)" rev-parse HEAD)" \
+        admission_head="$(GIT_OPTIONAL_LOCKS=0 git -C "$checkout" rev-parse HEAD)" \
           || { rm -rf "$job"; die "could not read checkout HEAD at admission"; }
+        [ "$(GIT_OPTIONAL_LOCKS=0 git -C "$checkout" symbolic-ref --quiet --short HEAD)" = "$(meta_get "$job" source_branch)" ] \
+          || { rm -rf "$job"; die 'checkout left the recorded source branch before admission'; }
         meta_set "$job" --arg head "$admission_head" '.base = $head'
       fi
       # started = admission: a queued job's wait is not run time (elapsed,
       # the dashboard's stall clock and the timeout all count from here).
-      meta_set "$job" --arg at "$(now_iso)" '.admitted = true | .admitted_at = $at | .queued_at = .started | .started = $at'
-      return 0
+      if [ "$guard_rc" = 0 ]; then
+        meta_set "$job" --arg at "$(now_iso)" '.admitted = true | .admitted_at = $at | .queued_at = .started | .started = $at'
+        return 0
+      fi
     fi
-    if [ "$running" -ge "$max" ] || [ "$attempt" -ge "$ADMIT_ATTEMPTS" ]; then
+    if [ "$running" -ge "$max" ] || { [ -n "$checkout" ] && [ "$checkout_running" -ge "$in_place_max" ]; } \
+      || [ "$attempt" -ge "$ADMIT_ATTEMPTS" ]; then
       rm -rf "$job"
+      if [ "$guard_rc" = 3 ]; then
+        echo 'farmout: ownership contention did not clear; overlap through untracked-only future files cannot be detected; try later' >&2
+        return 2
+      fi
       ${ADMIT_RETURN_FULL:-false} && return 4
-      echo "farmout: at max concurrent jobs ($max); try later (or use --queue)" >&2
+      if [ "$overall" -ge "$max" ]; then
+        echo "farmout: at max concurrent jobs ($max); try later (or use --queue)" >&2
+      else
+        echo "farmout: at max in-place jobs for checkout ($in_place_max): $checkout; try later (or use --queue)" >&2
+      fi
       exit 4
     fi
     rm -rf "$job"
@@ -401,7 +526,10 @@ cmd_run() {
     repo="$scratch"
   fi
   local source_branch; source_branch="$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null)"
-  $in_place && { in_place_preflight "$repo" "$source_branch" "$allow_default" "${owns[@]}" || exit 2; }
+  if $in_place; then
+    in_place_preflight "$repo" "$source_branch" "$allow_default" "${owns[@]}" || exit 2
+    in_place_overlap_guard '' "$repo" "$(jq -n '$ARGS.positional' --args "${owns[@]}")" admitted-only || exit 2
+  fi
 
   # The worker runs in a separate worktree; an absolute path into the source
   # checkout would let an auto-approved worker edit the source directly.
@@ -491,6 +619,7 @@ cmd_run() {
     --arg parent_pid "${CLAUDE_PID:-}" \
     --arg base_ref "$ref" --arg scratch "$scratch" \
     --argjson owns "$(jq -n '$ARGS.positional' --args ${owns[@]+"${owns[@]}"})" \
+    --argjson allow_default "$allow_default" \
     --argjson out_globs "$(if [ ${#out_globs[@]} -gt 0 ]; then printf '%s\n' "${out_globs[@]}" | jq -R . | jq -cs .; else echo null; fi)" \
     '{id:$id, cli:$cli, mode:$mode, repo:$repo, base:$base, out_globs:$out_globs,
       base_ref:(if $base_ref == "" then null else $base_ref end),
@@ -508,12 +637,12 @@ cmd_run() {
       source_branch:(if $source_branch == "" then null else $source_branch end),
       parent_session:(if $parent_session == "" then null else $parent_session end),
       parent_pid:(if ($parent_pid|test("^[0-9]+$")) then ($parent_pid|tonumber) else null end)}
-      | if $mode == "in-place" then . + {checkout:$repo, owns:$owns, head_end:null, branch_end:null,
+      | if $mode == "in-place" then . + {base:null, checkout:$repo, owns:$owns, allow_default_branch:$allow_default, head_end:null, branch_end:null,
           commits:[], unattributed:[], uncommitted:[], outside_owns:[]} else . end')"
 
   local max_jobs; max_jobs="$(cfg_limit max_jobs)"; [ -n "$max_jobs" ] || max_jobs="$DEFAULT_MAX_JOBS"
-  if $queue; then admit_queued "$id" "$job" "$max_jobs" "$meta_json"
-  else admit_job "$id" "$job" "$max_jobs" "$meta_json"
+  if $queue; then admit_queued "$id" "$job" "$max_jobs" "$meta_json" || exit $?
+  else admit_job "$id" "$job" "$max_jobs" "$meta_json" || exit $?
   fi
   [ "$mode" != in-place ] || snap="$(meta_get "$job" base)"
 

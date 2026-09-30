@@ -53,6 +53,309 @@ wait_for_meta_pid() { # id
 
 make_feature_branch() { git -C "$REPO" branch -M feature/in-place-test; }
 
+start_in_place_holder() { # id owns (sets HOLDER_RUNNER)
+  local id="$1" owns="$2"
+  printf '%s\n' 'FAKE: hang' > "$T/holder-$id.md"
+  ( export FARMOUT_TEST_JOB_ID="$id"
+    cd "$REPO" && "$FARMOUT" run fake --in-place --owns "$owns" --timeout 60s --brief "$T/holder-$id.md"
+  ) > "$T/holder-$id-out" 2> "$T/holder-$id-err" &
+  HOLDER_RUNNER=$!
+  wait_for_meta_pid "$id"
+}
+
+stop_in_place_holder() { # id runner
+  "$FARMOUT" kill "$1" >/dev/null
+  wait "$2" 2>/dev/null
+  return 0
+}
+
+track_in_place_paths() {
+  mkdir -p "$REPO/dir"
+  printf '%s\n' b > "$REPO/dir/b.txt"
+  printf '%s\n' c > "$REPO/c.txt"
+  git -C "$REPO" add dir/b.txt c.txt
+  git -C "$REPO" -c user.name=t -c user.email=t@t commit -qm 'lane fixtures'
+}
+
+test_config_in_place_max_default_and_validation() {
+  . "$ROOT/lib/common.sh"; . "$ROOT/lib/adapters.sh"; . "$ROOT/lib/config.sh"
+  assert_eq "$DEFAULT_IN_PLACE_MAX" 3
+  assert_eq "$(cfg_limit in_place_max)" ''
+  local value
+  for value in 1 32 '"3"'; do
+    CFG_JSON="{\"limits\":{\"in_place_max\":$value}}"
+    assert_eq "$(cfg_limit in_place_max)" "${value//\"/}"
+  done
+  for value in 0 33 -1 1.5 true false '"no"' '{}' '[]'; do
+    CFG_JSON="{\"limits\":{\"in_place_max\":$value}}"
+    assert_eq "$(cfg_limit in_place_max 2> "$T/config-err")" '' "$value"
+    assert_contains "$(cat "$T/config-err")" invalid\ limits.in_place_max
+  done
+}
+
+test_in_place_refuses_overlapping_owns() {
+  make_feature_branch; track_in_place_paths
+  start_in_place_holder first a.txt; local first_runner="$HOLDER_RUNNER"
+  brief 'FAKE: print ok'; run_job fake --in-place --owns a.txt
+  assert_eq "$RC" 2 "$ERR"
+  assert_contains "$ERR" first
+  assert_contains "$ERR" 'untracked-only future files cannot be detected'
+  assert_eq "$(ls "$FARMOUT_HOME/jobs" | wc -l | tr -d ' ')" 1 'overlap claimed a job'
+  stop_in_place_holder first "$first_runner"
+  start_in_place_holder glob 'dir/**'; local glob_runner="$HOLDER_RUNNER"
+  run_job fake --in-place --owns dir/b.txt
+  assert_eq "$RC" 2 "$ERR"; assert_contains "$ERR" glob
+  stop_in_place_holder glob "$glob_runner"
+}
+
+test_in_place_allows_disjoint_owns() {
+  make_feature_branch; track_in_place_paths
+  start_in_place_holder first a.txt; local runner="$HOLDER_RUNNER"
+  brief 'FAKE: print ok'; run_job fake --in-place --owns c.txt
+  assert_eq "$RC" 0 "$ERR"
+  assert_eq "$(meta "$ID" admitted)" true
+  stop_in_place_holder first "$runner"
+}
+
+test_in_place_ownership_uses_git_magic_and_nul_paths() {
+  make_feature_branch; track_in_place_paths
+  local unusual=$'odd\nname.txt'
+  printf '%s\n' tracked > "$REPO/$unusual"
+  printf '%s\n' tracked > "$REPO/odd"
+  printf '%s\n' tracked > "$REPO/name.txt"
+  git -C "$REPO" add -- "$unusual" odd name.txt
+  git -C "$REPO" -c user.name=t -c user.email=t@t commit -qm 'unusual paths'
+  start_in_place_holder newline "$(printf ':(literal)%s' "$unusual")"; local runner="$HOLDER_RUNNER"
+  brief 'FAKE: print ok'; run_job fake --in-place --owns odd --owns name.txt
+  assert_eq "$RC" 0 "$ERR"
+  run_job fake --in-place --owns "$(printf ':(literal)%s' "$unusual")"
+  assert_eq "$RC" 2 "$ERR"; assert_contains "$ERR" newline
+  stop_in_place_holder newline "$runner"
+  start_in_place_holder magic ':(glob)dir/*.txt'; runner="$HOLDER_RUNNER"
+  # An exclusion applies to the whole pathspec set, not to a shell glob union.
+  run_job fake --in-place --owns ':(top)**' --owns ':(exclude)dir/b.txt'
+  assert_eq "$RC" 0 "$ERR"
+  run_job fake --in-place --owns ':(top,literal)dir/b.txt'
+  assert_eq "$RC" 2 "$ERR"; assert_contains "$ERR" magic
+  stop_in_place_holder magic "$runner"
+}
+
+test_in_place_guards_canonical_checkout_aliases() {
+  make_feature_branch; track_in_place_paths
+  printf '%s\n' '{"limits":{"max_jobs":4,"in_place_max":1}}' > "$FARMOUT_CONFIG"
+  local alias="$T/checkout-alias"
+  ln -s "$REPO" "$alias"
+  start_in_place_holder aliased a.txt; local runner="$HOLDER_RUNNER"
+  local m="$FARMOUT_HOME/jobs/aliased/meta.json"
+  jq --arg r "$alias" '.repo=$r | .checkout=$r' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
+  brief 'FAKE: print ok'; run_job fake --in-place --owns a.txt --repo "$alias"
+  assert_eq "$RC" 2 "$ERR"; assert_contains "$ERR" aliased
+  run_job fake --in-place --owns c.txt --repo "$alias"
+  assert_eq "$RC" 4 "$ERR"; assert_contains "$ERR" 'max in-place jobs for checkout'
+  stop_in_place_holder aliased "$runner"
+}
+
+test_in_place_cap_defaults_to_three() {
+  make_feature_branch; track_in_place_paths
+  printf '%s\n' fourth > "$REPO/fourth.txt"
+  git -C "$REPO" add fourth.txt
+  git -C "$REPO" -c user.name=t -c user.email=t@t commit -qm 'fourth lane'
+  local path id=0
+  for path in a.txt dir/b.txt c.txt; do
+    id=$((id + 1)); mkdir -p "$FARMOUT_HOME/jobs/$id"
+    jq -n --arg r "$REPO" --arg p "$path" --argjson pid "$$" \
+      '{mode:"in-place",checkout:$r,owns:[$p],admitted:true,status:"running",sup_pid:$pid}' > "$FARMOUT_HOME/jobs/$id/meta.json"
+  done
+  brief 'FAKE: print ok'; run_job fake --in-place --owns fourth.txt
+  assert_eq "$RC" 4 "$ERR"
+  assert_contains "$ERR" 'max in-place jobs for checkout (3)'
+}
+
+test_in_place_cap_per_checkout() {
+  make_feature_branch; track_in_place_paths
+  printf '%s\n' '{"limits":{"max_jobs":4,"in_place_max":1}}' > "$FARMOUT_CONFIG"
+  start_in_place_holder first a.txt; local runner="$HOLDER_RUNNER"
+  brief 'FAKE: print ok'; run_job fake --in-place --owns c.txt
+  assert_eq "$RC" 4 "$ERR"
+  assert_contains "$ERR" 'max in-place jobs for checkout'
+  assert_eq "$(ls "$FARMOUT_HOME/jobs" | wc -l | tr -d ' ')" 1 'cap refusal left a dir'
+  # Queue waits for this cap even with spare overall capacity.
+  ( export FARMOUT_QUEUE_POLL_S=0.1 FARMOUT_TEST_JOB_ID=checkout-waiter
+    cd "$REPO" && "$FARMOUT" run fake --in-place --owns c.txt --queue --brief "$T/brief.md"
+  ) > "$T/wait-out" 2> "$T/wait-err" &
+  local waiter=$! i=0
+  while ! grep -q 'queued .* for a slot' "$T/wait-err" && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  grep -q 'queued .* for a slot' "$T/wait-err" || fail 'checkout cap did not queue'
+  stop_in_place_holder first "$runner"
+  wait "$waiter"; assert_eq "$?" 0 "$(cat "$T/wait-err")"
+  assert_eq "$(meta checkout-waiter admitted)" true
+}
+
+test_in_place_cap_does_not_cross_checkouts() {
+  make_feature_branch
+  printf '%s\n' '{"limits":{"max_jobs":4,"in_place_max":1}}' > "$FARMOUT_CONFIG"
+  local linked="$T/linked"
+  git -C "$REPO" worktree add -q -b linked-lane "$linked"
+  start_in_place_holder first a.txt; local runner="$HOLDER_RUNNER"
+  brief 'FAKE: print ok'
+  (cd "$linked" && "$FARMOUT" run fake --in-place --owns a.txt --brief "$T/brief.md") > "$T/linked-out" 2> "$T/linked-err"
+  assert_eq "$?" 0 "$(cat "$T/linked-err")"
+  assert_eq "$(meta "$(head -1 "$T/linked-out")" checkout)" "$linked"
+  stop_in_place_holder first "$runner"
+}
+
+assert_queued_in_place_refused() {
+  wait "$QUEUED_RUNNER"; local rc=$?
+  assert_eq "$rc" 2 "$(cat "$T/queued-err")"
+  [ ! -e "$FARMOUT_HOME/jobs/queued-in-place" ] || fail 'refused queued job left its dir'
+  [ -z "$(find "$FARMOUT_HOME/queue" -type f -print)" ] || fail 'refused queued job left its ticket'
+  [ ! -s "$T/queued-out" ] || fail 'refused queued job launched a worker'
+}
+
+test_queued_in_place_rechecks_dirty_owned_paths() {
+  make_feature_branch; start_queued_in_place
+  printf '%s\n' 'user change while queued' > "$REPO/a.txt"
+  local head index work
+  head="$(git -C "$REPO" rev-parse HEAD)"; index="$(git hash-object "$REPO/.git/index")"
+  work="$(git -C "$REPO" diff)"
+  rm -rf "$FARMOUT_HOME/jobs/blocker"
+  assert_queued_in_place_refused
+  assert_contains "$(cat "$T/queued-err")" a.txt
+  assert_eq "$(git -C "$REPO" rev-parse HEAD)" "$head"
+  assert_eq "$(git hash-object "$REPO/.git/index")" "$index"
+  assert_eq "$(git -C "$REPO" diff)" "$work"
+}
+
+test_queued_in_place_rechecks_overlap() {
+  make_feature_branch; start_queued_in_place 2
+  local other="$FARMOUT_HOME/jobs/later-owner"
+  mkdir -p "$other"
+  jq -n --arg r "$REPO" --argjson pid "$$" \
+    '{mode:"in-place",checkout:$r,owns:["a.txt"],admitted:true,status:"running",sup_pid:$pid}' > "$other/meta.json"
+  local index; index="$(git hash-object "$REPO/.git/index")"
+  rm -rf "$FARMOUT_HOME/jobs/blocker" "$FARMOUT_HOME/jobs/blocker2"
+  assert_queued_in_place_refused
+  assert_contains "$(cat "$T/queued-err")" later-owner
+  assert_contains "$(cat "$T/queued-err")" 'untracked-only future files cannot be detected'
+  assert_eq "$(git hash-object "$REPO/.git/index")" "$index"
+}
+
+test_queued_in_place_base_unset_until_admission() {
+  make_feature_branch; start_queued_in_place
+  local state; state="$("$FARMOUT" status queued-in-place)"
+  # Release the waiter even when the assertion fails, to keep the fixture bounded.
+  rm -rf "$FARMOUT_HOME/jobs/blocker"
+  wait "$QUEUED_RUNNER"; assert_eq "$?" 0
+  assert_eq "$(printf '%s' "$state" | jq -r .base)" null 'queued base was recorded before guards'
+}
+
+test_queued_in_place_rechecks_branch_and_default() {
+  local branch
+  for branch in detached main different-feature; do
+    make_feature_branch; start_queued_in_place
+    case "$branch" in
+      detached) git -C "$REPO" checkout -q --detach ;;
+      *) git -C "$REPO" checkout -q -b "$branch" ;;
+    esac
+    local index head
+    index="$(git hash-object "$REPO/.git/index")"; head="$(git -C "$REPO" rev-parse HEAD)"
+    rm -rf "$FARMOUT_HOME/jobs/blocker"
+    assert_queued_in_place_refused
+    case "$branch" in
+      detached) assert_contains "$(cat "$T/queued-err")" 'detached HEAD' ;;
+      main) assert_contains "$(cat "$T/queued-err")" 'default branch' ;;
+      *) assert_contains "$(cat "$T/queued-err")" 'source branch' ;;
+    esac
+    assert_eq "$(git hash-object "$REPO/.git/index")" "$index"
+    assert_eq "$(git -C "$REPO" rev-parse HEAD)" "$head"
+    git -C "$REPO" checkout -q feature/in-place-test
+    [ "$branch" = detached ] || git -C "$REPO" branch -D "$branch" >/dev/null
+  done
+}
+
+test_queued_in_place_rechecks_remote_default() {
+  make_feature_branch; start_queued_in_place
+  git -C "$REPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/feature/in-place-test
+  rm -rf "$FARMOUT_HOME/jobs/blocker"
+  assert_queued_in_place_refused
+  assert_contains "$(cat "$T/queued-err")" 'default branch'
+}
+
+test_queued_in_place_preserves_default_branch_override() {
+  make_feature_branch
+  git -C "$REPO" branch -M main
+  start_queued_in_place 1 --allow-default-branch
+  rm -rf "$FARMOUT_HOME/jobs/blocker"
+  wait "$QUEUED_RUNNER"; assert_eq "$?" 0 "$(cat "$T/queued-err")"
+  assert_eq "$(meta queued-in-place admitted)" true
+  assert_eq "$(meta queued-in-place source_branch)" main
+}
+
+test_in_place_checkout_cap_counts_claimed_unadmitted() {
+  make_feature_branch; track_in_place_paths
+  printf '%s\n' '{"limits":{"max_jobs":4,"in_place_max":1}}' > "$FARMOUT_CONFIG"
+  local pause="$T/admit-pause"; mkfifo "$pause"
+  brief 'FAKE: hang'
+  ( export FARMOUT_TEST_JOB_ID=claimed FARMOUT_TEST_ADMIT_PAUSE="$pause"
+    cd "$REPO" && "$FARMOUT" run fake --in-place --owns a.txt --timeout 60s --brief "$T/brief.md"
+  ) > "$T/claimed-out" 2> "$T/claimed-err" &
+  local runner=$! i=0
+  while [ ! -f "$pause.paused" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  [ -f "$pause.paused" ] || fail 'claim did not pause'
+  brief 'FAKE: print ok'; run_job fake --in-place --owns c.txt
+  local rc="$RC" err="$ERR"
+  echo go > "$pause"
+  wait_for_meta_pid claimed
+  stop_in_place_holder claimed "$runner"
+  assert_eq "$rc" 4 "$err"
+  assert_contains "$err" 'max in-place jobs for checkout'
+}
+
+test_in_place_overlapping_claims_admit_exactly_one() {
+  make_feature_branch
+  local pause="$T/overlap-pause"; mkfifo "$pause"
+  brief 'FAKE: hang'
+  ( export FARMOUT_TEST_JOB_ID=claim-first FARMOUT_TEST_ADMIT_PAUSE="$pause"
+    cd "$REPO" && "$FARMOUT" run fake --in-place --owns a.txt --timeout 60s --brief "$T/brief.md"
+  ) > "$T/first-out" 2> "$T/first-err" &
+  local first=$! i=0
+  while [ ! -f "$pause.paused" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  [ -f "$pause.paused" ] || fail 'first claimant never paused'
+  ( export FARMOUT_TEST_JOB_ID=claim-second
+    cd "$REPO" && "$FARMOUT" run fake --in-place --owns a.txt --timeout 60s --brief "$T/brief.md"
+  ) > "$T/second-out" 2> "$T/second-err" &
+  local second=$! before_release=false
+  i=0
+  while [ "$i" -lt 100 ]; do
+    if grep -q 'overlapping claimed job' "$T/second-err"; then break; fi
+    if [ -n "$(meta claim-second pid 2>/dev/null)" ] && [ "$(meta claim-second pid 2>/dev/null)" != null ]; then before_release=true; break; fi
+    sleep 0.1; i=$((i + 1))
+  done
+  echo go > "$pause"
+  i=0
+  while [ "$i" -lt 150 ]; do
+    if grep -q 'ownership overlaps' "$T/first-err" "$T/second-err"; then break; fi
+    if [ "$(meta claim-first admitted 2>/dev/null)" = true ] && [ "$(meta claim-second admitted 2>/dev/null)" = true ]; then break; fi
+    sleep 0.1; i=$((i + 1))
+  done
+  local admitted=0 id winner='' loser=''
+  for id in claim-first claim-second; do
+    if [ "$(meta "$id" admitted 2>/dev/null)" = true ]; then
+      admitted=$((admitted + 1)); winner="$id"
+      "$FARMOUT" kill "$id" >/dev/null
+    else loser="$id"; fi
+  done
+  wait "$first"; local first_rc=$?
+  wait "$second"; local second_rc=$?
+  assert_eq "$admitted" 1 'overlapping concurrent claimants must have exactly one winner'
+  $before_release && fail 'second admitted while first was claimed but not admitted'
+  if [ "$loser" = claim-first ]; then
+    assert_eq "$first_rc" 2; assert_contains "$(cat "$T/first-err")" "$winner"
+  else
+    assert_eq "$second_rc" 2; assert_contains "$(cat "$T/second-err")" "$winner"
+  fi
+}
+
 test_in_place_adapter_argument_preserves_trailing_newlines() {
   . "$ROOT/lib/common.sh"; . "$ROOT/lib/adapters.sh"
   local job="$T/argv-job" cli arg found
@@ -136,12 +439,18 @@ test_in_place_allows_explicit_current_repo() {
 }
 
 start_queued_in_place() {
-  printf '%s\n' '{"limits":{"max_jobs":1}}' > "$FARMOUT_CONFIG"
+  local max="${1:-1}"
+  local extra=(); [ $# -lt 2 ] || extra+=("$2")
+  printf '{"limits":{"max_jobs":%s}}\n' "$max" > "$FARMOUT_CONFIG"
   mkdir -p "$FARMOUT_HOME/jobs/blocker"
   jq -n --argjson pid "$$" '{admitted:true,status:"running",sup_pid:$pid}' > "$FARMOUT_HOME/jobs/blocker/meta.json"
+  if [ "$max" = 2 ]; then
+    mkdir -p "$FARMOUT_HOME/jobs/blocker2"
+    cp "$FARMOUT_HOME/jobs/blocker/meta.json" "$FARMOUT_HOME/jobs/blocker2/meta.json"
+  fi
   brief 'FAKE: print ok'
   ( export FARMOUT_QUEUE_POLL_S=0.1 FARMOUT_TEST_JOB_ID=queued-in-place
-    cd "$REPO" && "$FARMOUT" run fake --in-place --owns a.txt --queue --brief "$T/brief.md"
+    cd "$REPO" && "$FARMOUT" run fake --in-place --owns a.txt --queue "${extra[@]}" --brief "$T/brief.md"
   ) > "$T/queued-out" 2> "$T/queued-err" &
   QUEUED_RUNNER=$!
   local i=0
