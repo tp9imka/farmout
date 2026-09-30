@@ -152,6 +152,12 @@ const commitsVM = commits => list(commits).filter(c => c && typeof c === 'object
   };
 });
 const HEURISTIC_LABEL = 'Attribution is heuristic: exact when concurrent lanes keep to their --owns paths; hashes may change after rebase.';
+const unattributedText = commit => {
+  if (typeof commit === 'string') return dash(commit);
+  if (!commit || typeof commit !== 'object') return DASH;
+  const text = value => typeof value === 'string' ? dash(value) : DASH;
+  return `${text(commit.sha)} ${text(commit.subject)}`;
+};
 
 export function focusJobVM(rec, f, blink) {
   const o = tileVM(rec, 'worker', f, { blink });
@@ -184,7 +190,7 @@ export function focusJobVM(rec, f, blink) {
   o.commits = inPlace ? commitsVM(rec.commits) : [];
   o.heuristicLabel = inPlace && (list(rec.commits).some(c => c && c.shared === true) || list(rec.unattributed).length > 0) ? HEURISTIC_LABEL : null;
   o.warnings = inPlace ? [
-    ['UNCOMMITTED OWNED PATHS', rec.uncommitted], ['PATHS OUTSIDE --owns', rec.outside_owns], ['UNATTRIBUTED COMMITS', rec.unattributed],
+    ['UNCOMMITTED OWNED PATHS', rec.uncommitted], ['PATHS OUTSIDE --owns', rec.outside_owns], ['UNATTRIBUTED COMMITS', list(rec.unattributed).map(unattributedText)],
   ].map(([title, items]) => ({ title, items: list(items).map(String) })).filter(w => w.items.length > 0) : [];
   o.error = rec.error ? String(rec.error) : null;
   o.out = (rec.out || []).map(String);

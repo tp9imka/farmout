@@ -22,7 +22,9 @@ const inPlace = (over = {}) => job({
     { sha: '987654321abc', subject: 'fix: shared <script>', shared: true, available: false,
       files: [{ path: 'docs/a b.md', added: null, deleted: 2 }] },
   ],
-  uncommitted: ['src/unfinished.js'], outside_owns: ['outside.txt'], unattributed: ['112233445566'],
+  uncommitted: ['src/unfinished.js'], outside_owns: ['outside.txt'],
+  unattributed: [{ sha: '1122334455667788990011223344556677889900', subject: 'fix: hand edit <script>',
+    files: [{ path: 'other.txt', added: 1, deleted: 0 }], shared: false }],
   ...over,
 });
 
@@ -270,18 +272,28 @@ test('in-place heuristic label appears only for shared or unattributed commits',
   const solo = { commits: [{ sha: 'solo', shared: false, files: [] }], unattributed: [] };
   assert.equal(focusJobVM(inPlace(solo), 0, '1').heuristicLabel, null);
   assert.match(focusJobVM(inPlace(), 0, '1').heuristicLabel, /Attribution is heuristic/);
-  assert.match(focusJobVM(inPlace({ ...solo, unattributed: ['other'] }), 0, '1').heuristicLabel, /hashes may change after rebase/);
+  assert.match(focusJobVM(inPlace({ ...solo, unattributed: [{ sha: 'other', subject: 'hand edit', files: [], shared: false }] }), 0, '1').heuristicLabel, /hashes may change after rebase/);
   assert.match(focusJobVM(inPlace({ ...solo, commits: [{ ...solo.commits[0], shared: true }] }), 0, '1').heuristicLabel, /--owns/);
   assert.equal(focusJobVM(inPlace({ commits: [], unattributed: [] }), 0, '1').heuristicLabel, null);
 });
 
 test('in-place warnings preserve each path and unattributed hash as text', () => {
-  const f = focusJobVM(inPlace(), 0, '1');
+  const rec = inPlace();
+  const before = JSON.stringify(rec);
+  const f = focusJobVM(rec, 0, '1');
   assert.deepEqual(f.warnings, [
     { title: 'UNCOMMITTED OWNED PATHS', items: ['src/unfinished.js'] },
     { title: 'PATHS OUTSIDE --owns', items: ['outside.txt'] },
-    { title: 'UNATTRIBUTED COMMITS', items: ['112233445566'] },
+    { title: 'UNATTRIBUTED COMMITS', items: ['1122334455667788990011223344556677889900 fix: hand edit <script>'] },
   ]);
+  assert.equal(JSON.stringify(rec), before);
+  const legacyAndIncomplete = focusJobVM(inPlace({ uncommitted: [], outside_owns: [], unattributed: [
+    'legacy-full-sha', { sha: 'full-sha' }, { subject: 'subject only' }, {},
+    { sha: { nested: true }, subject: ['not a subject'] }, { sha: 123, subject: false }, null, 12,
+  ] }), 0, '1');
+  assert.deepEqual(legacyAndIncomplete.warnings[0].items,
+    ['legacy-full-sha', 'full-sha --', '-- subject only', '-- --', '-- --', '-- --', '--', '--']);
+  for (const item of legacyAndIncomplete.warnings[0].items) assert.doesNotMatch(item, /\[object Object\]/);
   assert.deepEqual(focusJobVM(inPlace({ uncommitted: [], outside_owns: [], unattributed: [] }), 0, '1').warnings, []);
   assert.deepEqual(focusJobVM(job({ mode: 'write', commits: inPlace().commits, uncommitted: ['unexpected'] }), 0, '1').warnings, []);
   assert.equal(focusJobVM(job(), 0, '1').showCommits, false);
