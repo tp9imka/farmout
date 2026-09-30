@@ -88,6 +88,243 @@ configure_in_place_author() {
   git -C "$REPO" config user.email repo@example.test
 }
 
+# Lifecycle commands must preserve even staged/unstaged user work and linked
+# checkouts. Optional locks are disabled so the probes do not refresh the index.
+lifecycle_git_snapshot() { # checkout destination
+  local repo="$1" dest="$2" index path
+  mkdir -p "$dest/untracked"
+  GIT_OPTIONAL_LOCKS=0 git -C "$repo" rev-parse HEAD > "$dest/head"
+  GIT_OPTIONAL_LOCKS=0 git -C "$repo" symbolic-ref --quiet --short HEAD > "$dest/branch"
+  index="$(GIT_OPTIONAL_LOCKS=0 git -C "$repo" rev-parse --git-path index)"
+  case "$index" in /*) ;; *) index="$repo/$index" ;; esac
+  cp "$index" "$dest/index"
+  GIT_OPTIONAL_LOCKS=0 git -C "$repo" diff --cached --binary > "$dest/index.diff"
+  GIT_OPTIONAL_LOCKS=0 git -C "$repo" diff --binary > "$dest/worktree.diff"
+  GIT_OPTIONAL_LOCKS=0 git -C "$repo" status --porcelain=v1 -z --untracked-files=all > "$dest/status"
+  GIT_OPTIONAL_LOCKS=0 git -C "$repo" worktree list --porcelain > "$dest/worktrees"
+  while IFS= read -r -d '' path; do
+    mkdir -p "$dest/untracked/$(dirname "$path")"
+    cp "$repo/$path" "$dest/untracked/$path"
+  done < <(GIT_OPTIONAL_LOCKS=0 git -C "$repo" ls-files --others --exclude-standard -z)
+}
+
+lifecycle_snapshot() { # destination
+  lifecycle_git_snapshot "$REPO" "$1/checkout"
+  lifecycle_git_snapshot "$T/lifecycle-linked" "$1/linked"
+}
+
+assert_lifecycle_git_unchanged() { # baseline
+  lifecycle_snapshot "$T/lifecycle-after"
+  diff -r "$1" "$T/lifecycle-after" || fail 'lifecycle changed Git or checkout state'
+  rm -rf "$T/lifecycle-after"
+  [ ! -s "$T/git-calls" ] || fail "lifecycle invoked Git: $(cat "$T/git-calls")"
+}
+
+prepare_lifecycle_checkout() {
+  make_feature_branch
+  git -C "$REPO" worktree add -q -b lifecycle-peer "$T/lifecycle-linked"
+  printf 'staged user edit\n' >> "$REPO/a.txt"; git -C "$REPO" add a.txt
+  printf 'unstaged user edit\n' >> "$REPO/a.txt"
+  printf 'user untracked\n' > "$REPO/user.txt"
+  printf 'linked user edit\n' >> "$T/lifecycle-linked/a.txt"
+  # No lifecycle command under test may even inspect Git. Stored hashes are
+  # snapshots, so accepting a record cannot depend on their current existence.
+  mkdir -p "$T/no-git"
+  printf '%s\n' '#!/bin/bash' 'printf "%s\n" "$*" >> "$FARMOUT_TEST_GIT_CALLS"' 'exit 99' > "$T/no-git/git"
+  chmod +x "$T/no-git/git"
+  export FARMOUT_TEST_GIT_CALLS="$T/git-calls"
+}
+
+lifecycle_record() { # id mode status [land-json]
+  local job="$FARMOUT_HOME/jobs/$1"
+  mkdir -p "$job"
+  jq -n --arg r "$REPO" --arg mode "$2" --arg status "$3" --argjson land "${4:-null}" \
+    --argjson pid "$$" '{mode:$mode,status:$status,land:$land,repo:$r,checkout:$r,
+      source_branch:"feature/in-place-test",branch:null,worktree:null,cli:"fake",
+      admitted:true,sup_pid:$pid,pgid:null,result_read:true,
+      base:"missing-base-after-rebase",head_end:"missing-head-after-rebase",
+      commits:[{sha:"missing-sha-after-rebase",subject:"stored snapshot",files:[],shared:false}],
+      owns:["a.txt"],uncommitted:[],outside_owns:[],unattributed:[]}' > "$job/meta.json"
+  printf 'stored result\n' > "$job/result.md"
+  printf 'stored log\n' > "$job/log"
+}
+
+run_lifecycle() {
+  PATH="$T/no-git:$PATH" "$FARMOUT" "$@" > "$T/action-out" 2> "$T/action-err"
+  RC=$?; OUT="$(cat "$T/action-out")"; ERR="$(cat "$T/action-err")"
+}
+
+test_accept_marks_in_place_reviewed_without_touching_git() {
+  prepare_lifecycle_checkout; lifecycle_record reviewed in-place ok
+  cp -R "$FARMOUT_HOME/jobs/reviewed" "$T/expected-record"
+  jq '.land = "accepted"' "$T/expected-record/meta.json" > "$T/expected-meta"
+  mv "$T/expected-meta" "$T/expected-record/meta.json"
+  lifecycle_snapshot "$T/before"
+  run_lifecycle accept reviewed
+  assert_eq "$RC" 0 "$ERR"; assert_eq "$(meta reviewed land)" accepted
+  diff -r "$T/expected-record" "$FARMOUT_HOME/jobs/reviewed" || fail 'accept changed more than land'
+  assert_lifecycle_git_unchanged "$T/before"
+  assert_contains "$("$FARMOUT" help)" 'farmout accept <job>'
+}
+
+test_accept_refuses_write_job() {
+  prepare_lifecycle_checkout
+  local mode
+  for mode in write read; do
+    lifecycle_record "$mode" "$mode" ok
+    cp -R "$FARMOUT_HOME/jobs/$mode" "$T/expected-$mode"
+    lifecycle_snapshot "$T/before-$mode"
+    run_lifecycle accept "$mode"
+    assert_eq "$RC" 2 "$mode"; assert_contains "$ERR" 'only in-place jobs'
+    diff -r "$T/expected-$mode" "$FARMOUT_HOME/jobs/$mode" || fail 'refusal changed record'
+    assert_lifecycle_git_unchanged "$T/before-$mode"
+  done
+}
+
+test_accept_refuses_running_job() {
+  prepare_lifecycle_checkout
+  local status ticket
+  for status in running queued; do
+    lifecycle_record "$status" in-place "$status"
+    cp -R "$FARMOUT_HOME/jobs/$status" "$T/expected-$status"
+    lifecycle_snapshot "$T/before-$status"
+    run_lifecycle accept "$status"
+    assert_eq "$RC" 2 "$status"; assert_contains "$ERR" "$status"; assert_contains "$ERR" 'finish'
+    diff -r "$T/expected-$status" "$FARMOUT_HOME/jobs/$status" || fail 'live refusal changed record'
+    assert_lifecycle_git_unchanged "$T/before-$status"
+  done
+  # A queued waiter can have a ticket but no job dir during admission retries.
+  mkdir -p "$FARMOUT_HOME/queue"; ticket="$FARMOUT_HOME/queue/000-ticket-only"
+  { printf '%s\n' "$$"; cat "$FARMOUT_HOME/jobs/queued/meta.json"; } > "$ticket"
+  cp "$ticket" "$T/expected-ticket"
+  lifecycle_snapshot "$T/before-ticket"
+  run_lifecycle accept ticket-only
+  assert_eq "$RC" 2; assert_contains "$ERR" queued; assert_contains "$ERR" finish
+  cmp "$ticket" "$T/expected-ticket" || fail 'accept changed queue ticket'
+  [ ! -e "$FARMOUT_HOME/jobs/ticket-only" ] || fail 'accept created queued job record'
+  assert_lifecycle_git_unchanged "$T/before-ticket"
+}
+
+test_accept_refuses_already_accepted_job() {
+  prepare_lifecycle_checkout; lifecycle_record reviewed in-place ok '"accepted"'
+  cp -R "$FARMOUT_HOME/jobs/reviewed" "$T/expected-record"
+  lifecycle_snapshot "$T/before"
+  run_lifecycle accept reviewed
+  assert_eq "$RC" 2; assert_contains "$ERR" 'already accepted'
+  diff -r "$T/expected-record" "$FARMOUT_HOME/jobs/reviewed" || fail 'repeated accept changed record'
+  assert_lifecycle_git_unchanged "$T/before"
+}
+
+test_clean_keeps_unaccepted_in_place_job() {
+  prepare_lifecycle_checkout; lifecycle_record unreviewed in-place ok
+  cp -R "$FARMOUT_HOME/jobs/unreviewed" "$T/expected-record"
+  lifecycle_snapshot "$T/before"
+  run_lifecycle clean
+  assert_eq "$RC" 0 "$ERR"; assert_contains "$OUT" 'unaccepted in-place job'
+  assert_contains "$OUT" 'farmout accept unreviewed'; assert_contains "$OUT" 'removed 0 job(s)'
+  diff -r "$T/expected-record" "$FARMOUT_HOME/jobs/unreviewed" || fail 'clean changed unreviewed record'
+  assert_lifecycle_git_unchanged "$T/before"
+  run_lifecycle clean --all
+  assert_eq "$RC" 0 "$ERR"; [ ! -d "$FARMOUT_HOME/jobs/unreviewed" ] || fail '--all retained record'
+  assert_lifecycle_git_unchanged "$T/before"
+}
+
+test_clean_removes_accepted_record_without_touching_checkout() {
+  prepare_lifecycle_checkout; lifecycle_record reviewed in-place ok '"accepted"'
+  # Even corrupted historical worktree/branch fields must never reach cleanup.
+  jq --arg c "$T/lifecycle-linked" '.worktree = $c | .branch = "lifecycle-peer"' \
+    "$FARMOUT_HOME/jobs/reviewed/meta.json" > "$T/meta"
+  mv "$T/meta" "$FARMOUT_HOME/jobs/reviewed/meta.json"
+  lifecycle_snapshot "$T/before"
+  run_lifecycle clean
+  assert_eq "$RC" 0 "$ERR"; assert_contains "$OUT" 'removed 1 job(s)'
+  [ ! -d "$FARMOUT_HOME/jobs/reviewed" ] || fail 'accepted record retained'
+  assert_lifecycle_git_unchanged "$T/before"
+  # Non-ok records follow shared unread-result protection, never worktree
+  # cleanup: read/empty records can go, meaningful unread output stays.
+  local status job
+  for status in failed killed empty rate-limited timeout; do
+    lifecycle_record "$status" in-place "$status"
+    lifecycle_record "unread-$status" in-place "$status"
+    job="$FARMOUT_HOME/jobs/unread-$status"
+    jq '.result_read = false' "$job/meta.json" > "$T/meta"; mv "$T/meta" "$job/meta.json"
+    cp -R "$job" "$T/expected-unread-$status"
+  done
+  lifecycle_record no-output in-place empty
+  jq '.result_read = false' "$FARMOUT_HOME/jobs/no-output/meta.json" > "$T/meta"
+  mv "$T/meta" "$FARMOUT_HOME/jobs/no-output/meta.json"
+  : > "$FARMOUT_HOME/jobs/no-output/result.md"; : > "$FARMOUT_HOME/jobs/no-output/log"
+  run_lifecycle clean
+  assert_eq "$RC" 0 "$ERR"; assert_contains "$OUT" 'removed 6 job(s)'
+  for status in failed killed empty rate-limited timeout; do
+    [ ! -d "$FARMOUT_HOME/jobs/$status" ] || fail "clean kept read $status record"
+    diff -r "$T/expected-unread-$status" "$FARMOUT_HOME/jobs/unread-$status" || fail 'clean changed unread record'
+  done
+  assert_lifecycle_git_unchanged "$T/before"
+  run_lifecycle clean --all
+  assert_eq "$RC" 0 "$ERR"; assert_contains "$OUT" 'removed 5 job(s)'
+  assert_lifecycle_git_unchanged "$T/before"
+}
+
+test_status_shows_in_place_and_accepted() {
+  prepare_lifecycle_checkout
+  lifecycle_record unreviewed in-place ok; lifecycle_record reviewed in-place ok '"accepted"'
+  lifecycle_record reader read ok; lifecycle_record writer write ok
+  mkdir -p "$FARMOUT_HOME/queue"
+  { printf '%s\n' "$$"; cat "$FARMOUT_HOME/jobs/unreviewed/meta.json"; } > "$FARMOUT_HOME/queue/000-waiting"
+  cp "$FARMOUT_HOME/queue/000-waiting" "$T/expected-ticket"
+  cp -R "$FARMOUT_HOME/jobs" "$T/expected-jobs"
+  lifecycle_snapshot "$T/before"
+  run_lifecycle status
+  assert_eq "$RC" 0 "$ERR"
+  assert_eq "$(printf '%s\n' "$OUT" | head -1 | awk '{print $6}')" REPO
+  assert_eq "$(printf '%s\n' "$OUT" | awk '$1 == "unreviewed" {print $4,$5}')" 'in-place -'
+  assert_eq "$(printf '%s\n' "$OUT" | awk '$1 == "reviewed" {print $4,$5}')" 'in-place accepted'
+  assert_eq "$(printf '%s\n' "$OUT" | awk '$1 == "reader" {print $4,$5}')" 'read -'
+  assert_eq "$(printf '%s\n' "$OUT" | awk '$1 == "writer" {print $4,$5}')" 'write -'
+  assert_eq "$(printf '%s\n' "$OUT" | awk '$1 == "waiting" {print $2}')" queued
+  run_lifecycle status waiting
+  assert_eq "$RC" 0 "$ERR"; assert_eq "$(printf '%s\n' "$OUT" | jq -r .status)" queued
+  assert_eq "$(printf '%s\n' "$OUT" | jq -r .mode)" in-place
+  cmp "$FARMOUT_HOME/queue/000-waiting" "$T/expected-ticket" || fail 'status mutated queue ticket'
+  diff -r "$T/expected-jobs" "$FARMOUT_HOME/jobs" || fail 'status mutated records'
+  assert_lifecycle_git_unchanged "$T/before"
+}
+
+test_kill_in_place_leaves_partial_checkout_changes() {
+  make_feature_branch
+  git -C "$REPO" worktree add -q -b lifecycle-peer "$T/lifecycle-linked"
+  brief 'FAKE: write a.txt partial-worker-change' "FAKE: write $T/partial-ready ready" 'FAKE: spawn' 'FAKE: hang'
+  (cd "$REPO" && FARMOUT_TEST_JOB_ID=partial "$FARMOUT" run fake --in-place --owns a.txt \
+    --timeout 60s --brief "$T/brief.md") > "$T/partial-out" 2> "$T/partial-err" &
+  local runner=$!
+  wait_for_meta_pid partial; wait_for_attribution_marker "$T/partial-ready"
+  # The worker has finished edits; only supervisor finalization follows kill.
+  printf 'staged user file\n' > "$REPO/user-staged.txt"; git -C "$REPO" add user-staged.txt
+  printf 'linked user edit\n' >> "$T/lifecycle-linked/a.txt"
+  lifecycle_snapshot "$T/before"
+  cp "$FARMOUT_HOME/jobs/partial/meta.json" "$T/meta-before-kill"
+  "$FARMOUT" kill partial > "$T/action-out" 2> "$T/action-err"; RC=$?
+  assert_eq "$RC" 0 "$(cat "$T/action-err")"
+  wait "$runner"; RC=$?; assert_eq "$RC" 1 "$(cat "$T/partial-err")"
+  assert_lifecycle_git_unchanged "$T/before"
+  assert_eq "$(cat "$REPO/a.txt")" partial-worker-change
+  assert_eq "$(meta partial status)" killed
+  assert_eq "$(meta partial land)" null
+  assert_eq "$(meta partial head_end)" "$(git -C "$REPO" rev-parse HEAD)"
+  assert_eq "$(meta partial branch_end)" feature/in-place-test
+  assert_eq "$(jq -c '.uncommitted' "$FARMOUT_HOME/jobs/partial/meta.json")" '["a.txt"]'
+  assert_eq "$(jq -c '.commits' "$FARMOUT_HOME/jobs/partial/meta.json")" '[]'
+  assert_eq "$(jq -Sc 'del(.status,.exit_code,.survivors,.ended,.head_end,.branch_end,.commits,.unattributed,.uncommitted,.outside_owns)' \
+    "$FARMOUT_HOME/jobs/partial/meta.json")" \
+    "$(jq -Sc 'del(.status,.exit_code,.survivors,.ended,.head_end,.branch_end,.commits,.unattributed,.uncommitted,.outside_owns)' "$T/meta-before-kill")" \
+    'kill changed metadata beyond shared finalization fields'
+  [ -f "$FARMOUT_HOME/jobs/partial/kill.requested" ] || fail 'kill request not recorded'
+  [ ! -e "$FARMOUT_HOME/jobs/partial/diff.patch" ] || fail 'kill captured a patch'
+  [ -n "$(meta partial ended)" ] && [ "$(meta partial ended)" != null ] || fail 'kill has no final timestamp'
+  [ -z "$(pgrep -g "$(meta partial pgid)")" ] || fail 'kill left worker group alive'
+}
+
 wait_for_attribution_marker() { # path
   local i=0
   while [ "$i" -lt 100 ]; do
@@ -853,18 +1090,22 @@ test_in_place_land_and_discard_refused_without_git_change() {
   git -C "$REPO" config user.name Worker; git -C "$REPO" config user.email worker@example.test
   brief 'FAKE: commit worker-change a.txt'; run_job fake --in-place --owns a.txt
   assert_eq "$RC" 0 "$ERR"
-  local head state cmd m="$FARMOUT_HOME/jobs/$ID/meta.json"
-  head="$(git -C "$REPO" rev-parse HEAD)"; state="$(git -C "$REPO" status --porcelain)"
+  local head cmd m="$FARMOUT_HOME/jobs/$ID/meta.json"
+  head="$(git -C "$REPO" rev-parse HEAD)"
   # Task 3 supplies these records; pin the command safety contract now.
   jq --arg sha "$head" '.commits = [{sha:$sha}]' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
+  prepare_lifecycle_checkout
+  lifecycle_snapshot "$T/before"
+  cp -R "$FARMOUT_HOME/jobs/$ID" "$T/expected-record"
   for cmd in land discard; do
-    "$FARMOUT" "$cmd" "$ID" > "$T/action-out" 2> "$T/action-err"; RC=$?
+    run_lifecycle "$cmd" "$ID"
     assert_eq "$RC" 2 "$cmd"
-    assert_eq "$(git -C "$REPO" rev-parse HEAD)" "$head"
-    assert_eq "$(git -C "$REPO" status --porcelain)" "$state"
+    assert_lifecycle_git_unchanged "$T/before"
+    diff -r "$T/expected-record" "$FARMOUT_HOME/jobs/$ID" || fail "$cmd changed record"
     assert_eq "$(meta "$ID" land)" null
-    if [ "$cmd" = land ]; then assert_contains "$(cat "$T/action-err")" "farmout accept $ID"
-    else assert_contains "$(cat "$T/action-err")" "git revert $head"; fi
+    if [ "$cmd" = land ]; then
+      assert_contains "$ERR" feature/in-place-test; assert_contains "$ERR" "farmout accept $ID"
+    else assert_contains "$ERR" "git revert $head"; fi
   done
 }
 

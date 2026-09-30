@@ -1,6 +1,6 @@
 #!/bin/bash
 # farmout - run a task on another agent CLI in an isolated git worktree.
-# Usage: farmout {run|status|result|kill|land|discard|clean|doctor} ...
+# Usage: farmout {run|status|result|kill|land|accept|discard|clean|doctor} ...
 
 SELF="$0"
 while [ -L "$SELF" ]; do
@@ -36,6 +36,7 @@ usage: farmout run <cli|auto> [--write | --in-place --owns <pathspec>...]
        farmout scores
        farmout kill <job>
        farmout land <job>
+       farmout accept <job>
        farmout discard <job>
        farmout clean [--all] [--mine]
        farmout doctor [--json]
@@ -962,16 +963,22 @@ cmd_status() {
     return
   fi
   local d
-  local land
-  printf '%-34s %-12s %-8s %-6s %-10s %s\n' JOB STATUS CLI MODE LAND SNAPSHOT-OF
+  local land mode repo
+  printf '%-34s %-12s %-8s %-8s %-10s %s\n' JOB STATUS CLI MODE LAND REPO
   for d in "$FARMOUT_HOME"/jobs/*/; do
     # Not yet admitted = a launch still claiming its slot (it may vanish on a
     # retry); queued waiters are listed from their tickets below.
     [ "$(jq -r '.admitted // true' "$d/meta.json" 2>/dev/null)" = true ] || continue
     d="${d%/}"
     land="$(meta_get "$d" land 2>/dev/null)"
-    printf '%-34s %-12s %-8s %-6s %-10s %s\n' "$(basename "$d")" "$(effective_status "$d")" \
-      "$(meta_get "$d" cli)" "$(meta_get "$d" mode)" "${land:--}" "$(basename "$(meta_get "$d" repo)")"
+    mode="$(meta_get "$d" mode)"
+    case "$mode" in
+      in-place) repo="$(meta_get "$d" checkout)" ;;
+      read|write) repo="$(meta_get "$d" repo)" ;;
+      *) repo="$(meta_get "$d" repo)" ;;
+    esac
+    printf '%-34s %-12s %-8s %-8s %-10s %s\n' "$(basename "$d")" "$(effective_status "$d")" \
+      "$(meta_get "$d" cli)" "$mode" "${land:--}" "$(basename "$repo")"
   done
   local t name
   for t in "$QUEUE_DIR"/*; do
@@ -992,7 +999,8 @@ cmd_result() {
     [ -n "$partial" ] && printf '%s\n%s\n' "--- partial result (no final message; recovered from the log)" "$partial"
   fi
   meta_set "$JOB" '.result_read = true'
-  if [ "$(meta_get "$JOB" mode)" = in-place ]; then
+  case "$(meta_get "$JOB" mode)" in
+    in-place)
     echo '--- commits attributed heuristically'
     jq -r '.commits[]? |
       def count($key): if any(.files[]; .[$key] == null) then "?" else ([.files[] | .[$key]] | add // 0 | tostring) end;
@@ -1015,7 +1023,9 @@ cmd_result() {
       fi
     done
     return 0
-  fi
+    ;;
+    read|write) ;;
+  esac
   if [ -d "$JOB/out" ]; then
     echo "--- out files ($JOB/out)"
     jq -r '.out[]? // empty' "$JOB/meta.json"
@@ -1158,9 +1168,12 @@ cmd_kill() {
 
 cmd_land() {
   require_job "$1"
-  [ "$(meta_get "$JOB" mode)" != in-place ] \
-    || die "in-place job; its commits are already on $(meta_get "$JOB" source_branch) - use farmout accept $1"
-  [ "$(meta_get "$JOB" mode)" = write ] || die "job $1 is read-only; nothing to land"
+  case "$(meta_get "$JOB" mode)" in
+    in-place) die "in-place job; its commits are already on $(meta_get "$JOB" source_branch) - use farmout accept $1" ;;
+    read) die "job $1 is read-only; nothing to land" ;;
+    write) ;;
+    *) die "job $1 has an unsupported mode; nothing to land" ;;
+  esac
   [ "$(effective_status "$JOB")" = ok ] || die "job $1 status is $(effective_status "$JOB"); only ok jobs land"
   [ -z "$(meta_get "$JOB" land)" ] || die "job $1 already $(meta_get "$JOB" land)"
   local repo; repo="$(meta_get "$JOB" repo)"
@@ -1180,12 +1193,39 @@ cmd_land() {
   echo "$1 landed as uncommitted changes"
 }
 
+cmd_accept() {
+  [ -n "${1:-}" ] || usage
+  # A queued job can temporarily have only its ticket, not a job directory.
+  queued_ticket "$1" >/dev/null && die "job $1 is queued; wait for it to finish before accepting"
+  require_job "$1"
+  local mode es
+  mode="$(meta_get "$JOB" mode)"
+  case "$mode" in
+    in-place) ;;
+    write) die "job $1 is write; only in-place jobs can be accepted - use farmout land $1" ;;
+    read) die "job $1 is read-only; only in-place jobs can be accepted; nothing to accept" ;;
+    *) die "job $1 has an unsupported mode; only in-place jobs can be accepted" ;;
+  esac
+  es="$(effective_status "$JOB")"
+  case "$es" in
+    running|queued) die "job $1 is $es; wait for it to finish before accepting" ;;
+  esac
+  jq -e '.land == null' "$JOB/meta.json" >/dev/null \
+    || die "job $1 already $(meta_get "$JOB" land); nothing to accept"
+  # Review the stored snapshot even if its hashes no longer exist after rebase.
+  meta_set "$JOB" '.land = "accepted"' || return
+  echo "$1 accepted (review recorded; git unchanged)"
+}
+
 cmd_discard() {
   require_job "$1"
-  if [ "$(meta_get "$JOB" mode)" = in-place ]; then
-    local commits; commits="$(jq -r '[.commits[]?.sha] | join(" ")' "$JOB/meta.json")"
-    die "in-place commits are on your branch; revert them with git if you reject the lane: git revert ${commits:-<sha...>}"
-  fi
+  case "$(meta_get "$JOB" mode)" in
+    in-place)
+      local commits; commits="$(jq -r '[.commits[]?.sha] | join(" ")' "$JOB/meta.json")"
+      die "in-place commits are on your branch; revert them with git if you reject the lane: git revert ${commits:-<sha...>}"
+      ;;
+    read|write) ;;
+  esac
   local es; es="$(effective_status "$JOB")"
   [ "$es" != running ] || die "job $1 is running; kill it first"
   [ "$(meta_get "$JOB" land)" != landed ] || die "job $1 already landed"
@@ -1219,12 +1259,24 @@ cmd_clean() {
     es="$(effective_status "$d")"
     [ "$es" = running ] && continue
     mode="$(meta_get "$d" mode)"; land="$(meta_get "$d" land)"
-    # A write job that is ok and never landed (or lost the race to land)
-    # holds unreviewed work; keep it unless --all says otherwise.
-    if ! $all && [ "$mode" = write ] && [ "$es" = ok ] \
-       && { [ -z "$land" ] || [ "$land" = conflict ]; }; then
-      echo "kept $(basename "$d") (unlanded write job; use --all)"
-      continue
+    # Successful lanes hold unreviewed work. Non-ok in-place records use the
+    # shared unread-result rule below, including failed/killed/empty/rate-limited.
+    if ! $all && [ "$es" = ok ]; then
+      case "$mode" in
+        write)
+          if [ -z "$land" ] || [ "$land" = conflict ]; then
+            echo "kept $(basename "$d") (unlanded write job; use --all)"
+            continue
+          fi
+          ;;
+        in-place)
+          if jq -e '.land == null' "$d/meta.json" >/dev/null; then
+            echo "kept $(basename "$d") (unaccepted in-place job; farmout accept $(basename "$d"); or use --all)"
+            continue
+          fi
+          ;;
+        read) ;;
+      esac
     fi
     if ! $all && [ "$(meta_get "$d" result_read)" != true ] && [ "$es" != lost ] \
        && { grep -q '[^[:space:]]' "$d/result.md" 2>/dev/null || [ -n "$(adapter_partial "$(meta_get "$d" cli)" "$d")" ]; }; then
@@ -1232,7 +1284,11 @@ cmd_clean() {
       continue
     fi
     [ "$es" = lost ] && kill_group "$(meta_get "$d" pgid)"
-    [ "$mode" = in-place ] || remove_worktree "$d"
+    case "$mode" in
+      in-place) ;; # Only the record is ours; the checkout and branch are not.
+      read|write) remove_worktree "$d" ;;
+      *) remove_worktree "$d" ;;
+    esac
     rm -rf "$d"; n=$((n + 1))
   done
   echo "removed $n job(s)"
@@ -1278,6 +1334,7 @@ case "$cmd" in
   scores) cmd_scores "$@" ;;
   kill) cmd_kill "$@" ;;
   land) cmd_land "$@" ;;
+  accept) cmd_accept "$@" ;;
   discard) cmd_discard "$@" ;;
   clean) cmd_clean "$@" ;;
   doctor) cmd_doctor "$@" ;;
