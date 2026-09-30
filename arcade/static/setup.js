@@ -93,6 +93,8 @@ function Limits({ sv, ops }) {
         onDown=${() => ops.bumpLimit('stall_min', -1)} onUp=${() => ops.bumpLimit('stall_min', 1)} />
       <${LimitRow} title="MAX CONCURRENT JOBS" note="Across all Claude sessions on this machine." value=${sv.lim.maxJobs} unit="JOBS" top="#2d2b2b"
         onDown=${() => ops.bumpLimit('max_jobs', -1)} onUp=${() => ops.bumpLimit('max_jobs', 1)} />
+      <${LimitRow} title="MAX IN-PLACE JOBS PER CHECKOUT" note="Running in-place jobs sharing one checkout; the overall job limit also applies." value=${sv.lim.inPlaceMax} unit="JOBS" top="#2d2b2b"
+        onDown=${() => ops.bumpLimit('in_place_max', -1)} onUp=${() => ops.bumpLimit('in_place_max', 1)} />
       <div style="display:grid; grid-template-columns:minmax(0,1fr) 240px; gap:20px; align-items:center; padding:16px 0; border-top:2px solid #2d2b2b; border-bottom:2px solid #2d2b2b;">
         <div style="display:flex; flex-direction:column; gap:8px;"><div style="font-size:11px;">KEEP UNLANDED WRITE JOBS ON CLEAN</div><div style="font-family:var(--font-body); font-size:14px; color:var(--color-neutral-400);">Clean skips worktrees whose patch was never landed or discarded. Only clean --all removes them.</div></div>
         <div style="display:flex; align-items:center; gap:10px;">
