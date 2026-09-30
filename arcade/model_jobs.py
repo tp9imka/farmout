@@ -16,6 +16,7 @@ import logs
 
 WRITE_MODE = "write"
 READ_MODE = "read"
+IN_PLACE_MODE = "in-place"
 
 TITLE_MAX = 80
 HOF_MAX = 10
@@ -24,8 +25,8 @@ _LAND_POSE = {None: "ready", "landed": "landed", "conflict": "conflict", "discar
 
 _SENTENCE_RE = re.compile(r".*?[.!?](?=\s|$)")
 
-# A running write job's files[] is re-measured at most this often. Its log
-# grows every second, so log growth says nothing about the worktree changing.
+# Running write/in-place files and ended in-place commit availability are
+# re-measured at most this often. Log growth says nothing about Git changing.
 FILES_REFRESH_S = 30
 # How often the background refresher looks for due jobs.
 FILES_TICK_S = 2
@@ -148,6 +149,41 @@ def _parse_numstat(text):
     return files
 
 
+def _meta_list(meta, key):
+    value = meta.get(key)
+    return value if isinstance(value, list) else []
+
+
+def _merge_files(files):
+    """Stable path order; one unknown count makes that total unknown."""
+    merged = {}
+    for row in files:
+        name = row["n"]
+        if name not in merged:
+            merged[name] = dict(row)
+            continue
+        for key in ("a", "d"):
+            before, count = merged[name][key], row[key]
+            merged[name][key] = None if before is None or count is None else before + count
+    return [merged[name] for name in sorted(merged)]
+
+
+def _files_from_commits(commits):
+    files = []
+    for commit in commits:
+        if not isinstance(commit, dict):
+            continue
+        for row in _meta_list(commit, "files"):
+            if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+                continue
+            counts = {}
+            for source, target in (("added", "a"), ("deleted", "d")):
+                value = row.get(source)
+                counts[target] = value if type(value) is int and value >= 0 else None
+            files.append(dict(counts, n=row["path"]))
+    return _merge_files(files)
+
+
 UNTRACKED_COUNT_MAX_BYTES = 2 * 1024 * 1024
 _BINARY_SNIFF_BYTES = 8000
 
@@ -200,7 +236,7 @@ class JobsModel(object):
 
         # Shared with the refresher thread; guarded by _files_lock.
         # _files_wanted: job_id -> spec tuple from the latest snapshot.
-        # _files_cache: job_id -> {"final", "at", "files"}.
+        # _files_cache: job_id -> {"final", "at", "files", "commits", "refresh"}.
         self._files_lock = threading.Lock()
         self._files_wanted = {}
         self._files_cache = {}
@@ -309,6 +345,8 @@ class JobsModel(object):
     def _in_jobs(record):
         if record["status"] in ("running", "lost", "queued"):
             return True
+        if record["mode"] == IN_PLACE_MODE:
+            return record["status"] == "ok" and record["land"] is None
         return (
             record["mode"] == WRITE_MODE
             and record["status"] == "ok"
@@ -381,6 +419,12 @@ class JobsModel(object):
             "replay": log_state.replay if log_state else [],
             "files": files,
             "worktree": meta.get("worktree") if mode == WRITE_MODE else None,
+            "checkout": meta.get("checkout") if mode == IN_PLACE_MODE else None,
+            "commits": self._commits_for(job_id, meta, mode),
+            "owns": _meta_list(meta, "owns"),
+            "uncommitted": _meta_list(meta, "uncommitted"),
+            "outside_owns": _meta_list(meta, "outside_owns"),
+            "unattributed": _meta_list(meta, "unattributed"),
             "parent_session": meta.get("parent_session"),
             "route": meta.get("route"),
             # Report files a read job handed back (--out), as absolute paths.
@@ -439,6 +483,8 @@ class JobsModel(object):
         if status == "lost":
             return "lost"
         if status == "ok":
+            if mode == IN_PLACE_MODE:
+                return "accepted" if land == "accepted" else "review"
             if mode == WRITE_MODE:
                 return _LAND_POSE.get(land, "ready")
             return "clear"
@@ -467,9 +513,38 @@ class JobsModel(object):
         return (now_ms - seen[1]) / 60000.0 > stall_min
 
     def _files_for(self, job_id, job_dir, meta, mode, is_ended):
-        if mode != WRITE_MODE:
-            return None
-        spec = (job_dir, meta.get("worktree"), meta.get("base"), meta.get("repo"), is_ended)
+        if mode == IN_PLACE_MODE:
+            return self._files_for_in_place(job_id, job_dir, meta, is_ended)
+        if mode == WRITE_MODE:
+            return self._files_for_worktree(job_id, job_dir, meta, is_ended)
+        return None
+
+    def _files_for_in_place(self, job_id, job_dir, meta, is_ended):
+        owns = tuple(p for p in _meta_list(meta, "owns") if isinstance(p, str) and p)
+        spec = (job_dir, meta.get("checkout"), meta.get("base"), meta.get("repo"), is_ended,
+                IN_PLACE_MODE, owns, _meta_list(meta, "commits"))
+        files = self._cached_files(job_id, spec)
+        # The final snapshot is already stored locally. Never display a
+        # cached live diff while the refresher checks commit availability.
+        return _files_from_commits(spec[7]) if is_ended else files
+
+    def _commits_for(self, job_id, meta, mode):
+        commits = _meta_list(meta, "commits")
+        if mode != IN_PLACE_MODE:
+            return commits
+        with self._files_lock:
+            cached = self._files_cache.get(job_id)
+            measured = cached.get("commits") if cached else None
+        if measured is not None:
+            return measured
+        return [dict(commit, available=None) for commit in commits if isinstance(commit, dict)]
+
+    def _files_for_worktree(self, job_id, job_dir, meta, is_ended):
+        spec = (job_dir, meta.get("worktree"), meta.get("base"), meta.get("repo"), is_ended, WRITE_MODE)
+        return self._cached_files(job_id, spec)
+
+    def _cached_files(self, job_id, spec):
+        is_ended = spec[4]
         with self._files_lock:
             self._files_wanted[job_id] = spec
             cached = self._files_cache.get(job_id)
@@ -487,19 +562,41 @@ class JobsModel(object):
         if cached is None:
             return True
         if cached["final"]:
-            return False
+            return cached.get("refresh", False) and self._clock() - cached["at"] >= FILES_REFRESH_S
         return is_ended or self._clock() - cached["at"] >= FILES_REFRESH_S
 
     def _measure_files(self, job_id, spec):
-        job_dir, worktree, base, repo, is_ended = spec
-        if is_ended:
+        job_dir, worktree, base, repo, is_ended = spec[:5]
+        commits = None
+        if spec[5] == IN_PLACE_MODE:
+            if is_ended:
+                files = _files_from_commits(spec[7])
+                commits = self._commits_from_checkout(worktree, spec[7])
+            else:
+                files = self._files_from_checkout(worktree, base, spec[6])
+        elif is_ended:
             files = self._files_from_patch(job_dir, repo)
         else:
             files = self._files_from_worktree(worktree, base)
         with self._files_lock:
             # A job pruned while git ran must not be resurrected.
             if self._files_wanted.get(job_id) == spec:
-                self._files_cache[job_id] = {"final": is_ended, "at": self._clock(), "files": files}
+                self._files_cache[job_id] = {"final": is_ended, "at": self._clock(), "files": files,
+                                            "commits": commits, "refresh": spec[5] == IN_PLACE_MODE}
+
+    def _commits_from_checkout(self, checkout, stored):
+        commits = []
+        for commit in stored:
+            if not isinstance(commit, dict):
+                continue
+            sha = commit.get("sha")
+            available = False
+            if checkout and isinstance(sha, str) and sha and not sha.startswith("-"):
+                exists = self._run_git(["cat-file", "-e", sha + "^{commit}"], checkout)
+                if exists is not None:
+                    available = self._run_git(["merge-base", "--is-ancestor", sha, "HEAD"], checkout) is not None
+            commits.append(dict(commit, available=available))
+        return commits
 
     def _refresh_due(self):
         with self._files_lock:
@@ -536,6 +633,19 @@ class JobsModel(object):
             count = _count_lines(os.path.join(worktree, name))
             files.append({"n": name, "a": count, "d": None if count is None else 0})
         return files
+
+    def _files_from_checkout(self, checkout, base, owns):
+        # An incomplete ownership contract must never turn into an unscoped
+        # diff of the user's checkout.
+        if not checkout or not base or not owns:
+            return None
+        committed = self._run_git(["diff", "--numstat", base + "..HEAD", "--"] + list(owns), checkout)
+        if committed is None:
+            return None
+        dirty = self._run_git(["diff", "--numstat", "--"] + list(owns), checkout)
+        if dirty is None:
+            return None
+        return _merge_files(_parse_numstat(committed) + _parse_numstat(dirty))
 
     def _files_from_patch(self, job_dir, repo):
         patch_path = os.path.join(job_dir, "diff.patch")

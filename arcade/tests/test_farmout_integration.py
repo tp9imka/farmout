@@ -23,6 +23,8 @@ JOB_FIELD_TYPES = {
     "started": _OPT_INT, "ended": _OPT_INT, "tool": _OPT_STR, "tokens": _OPT_INT,
     "coins": (dict, type(None)), "replay": (list,), "files": (list, type(None)),
     "worktree": _OPT_STR, "parent_session": _OPT_STR, "route": _OPT_STR, "out": (list,),
+    "commits": (list,), "owns": (list,), "uncommitted": (list,), "outside_owns": (list,),
+    "unattributed": (list,), "checkout": _OPT_STR,
 }
 
 
@@ -80,6 +82,10 @@ class RealFarmoutIntoJobsModelTest(unittest.TestCase):
                 self.assertNotIsInstance(value, bool, "{}.{}".format(job_id, field))
 
         read, write = records[read_id], records[write_id]
+        for rec in (read, write):
+            for field in ("commits", "owns", "uncommitted", "outside_owns", "unattributed"):
+                self.assertEqual(rec[field], [], field)
+            self.assertIsNone(rec["checkout"])
         self.assertEqual(("read", "ok", "clear"), (read["mode"], read["status"], read["pose"]))
         self.assertEqual(("write", "ok", "ready"), (write["mode"], write["status"], write["pose"]))
         self.assertIn(write_id, [r["id"] for r in snap["jobs"]])
@@ -90,6 +96,46 @@ class RealFarmoutIntoJobsModelTest(unittest.TestCase):
         self.assertTrue(os.path.isdir(write["worktree"]))
         self.assertEqual("Read the file.", read["title"])
         self.assertEqual([], snap["errors"])
+
+    def test_in_place_commit_review_and_accept_feed_the_frozen_schema(self):
+        self._git("branch", "-M", "feature/in-place-model")
+        self._git("config", "user.name", "repo-user")
+        self._git("config", "user.email", "repo@example.test")
+        with open(os.path.join(self.repo, "user.txt"), "w") as f:
+            f.write("untouched user work\n")
+        job_id = self._run(["Commit the owned file.", "", "FAKE: commit worker-change a.txt"],
+                           "--in-place", "--owns", "a.txt")
+        model = model_jobs.JobsModel(self.home)
+        snap = model.snapshot(int(time.time() * 1000), 10)
+        self.assertEqual([r["id"] for r in snap["jobs"]], [job_id])
+        rec = snap["jobs"][0]
+        self.assertEqual(set(rec), set(JOB_FIELD_TYPES))
+        for field, types in JOB_FIELD_TYPES.items():
+            self.assertIsInstance(rec[field], types, field)
+        self.assertEqual((rec["mode"], rec["status"], rec["pose"]), ("in-place", "ok", "review"))
+        self.assertIsNone(rec["worktree"])
+        self.assertEqual(rec["checkout"], self.repo)
+        self.assertEqual(rec["owns"], ["a.txt"])
+        self.assertEqual(rec["files"], [{"n": "a.txt", "a": 1, "d": 1}])
+        self.assertEqual(len(rec["commits"]), 1)
+        self.assertTrue(rec["commits"][0]["available"])
+        before = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo)
+        self.assertEqual(rec["commits"][0]["sha"], before.decode().strip())
+        with open(os.path.join(self.repo, ".git", "index"), "rb") as f:
+            index_before = f.read()
+        accepted = subprocess.run([FARMOUT_BIN, "accept", job_id], cwd=self.repo, env=self.env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr.decode())
+        snap = model.snapshot(int(time.time() * 1000), 10)
+        self.assertEqual(snap["jobs"], [])
+        self.assertEqual(snap["hof"][0]["pose"], "accepted")
+        self.assertEqual(snap["hof"][0]["commits"], rec["commits"])
+        self.assertEqual(subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo), before)
+        with open(os.path.join(self.repo, ".git", "index"), "rb") as f:
+            self.assertEqual(f.read(), index_before)
+        with open(os.path.join(self.repo, "user.txt")) as f:
+            self.assertEqual(f.read(), "untouched user work\n")
+        self.assertEqual(snap["errors"], [])
 
 
 if __name__ == "__main__":

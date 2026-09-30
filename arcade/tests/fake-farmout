@@ -3,7 +3,7 @@
 
 - FAKE_FARMOUT_LOG: path to append one JSON line per invocation ({"argv": [...]}).
 - FAKE_FARMOUT_<VERB>_EXIT: exit code for that verb (default 0).
-- FAKE_FARMOUT_STDOUT / FAKE_FARMOUT_STDERR: text to print for kill/land/discard.
+- FAKE_FARMOUT_STDOUT / FAKE_FARMOUT_STDERR: text to print for kill/land/discard/accept.
 - FAKE_FARMOUT_DOCTOR_JSON: stdout for `doctor --json` (default "[]").
 - FAKE_FARMOUT_SLEEP: seconds to sleep before responding (for concurrency tests).
 - FAKE_FARMOUT_GRANDCHILD_PIDFILE: spawns a real `sleep 60` grandchild and

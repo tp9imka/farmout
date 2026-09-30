@@ -709,7 +709,7 @@ class ConfigApiTestCase(_ServerTestCase):
         self.assertIn("config", data)
         self.assertIn("etag", data)
         self.assertEqual(resp.getheader("ETag"), data["etag"])
-        self.assertEqual(data["config"]["limits"], {"stall_min": 10, "max_jobs": 4})
+        self.assertEqual(data["config"]["limits"], {"stall_min": 10, "max_jobs": 4, "in_place_max": 3})
 
     def test_dirty_config_on_disk_round_trips_clean_through_get_and_put(self):
         # workers.codx is a typo the UI would never send, and version 2 is
@@ -961,6 +961,71 @@ class ActionsTestCase(_ServerTestCase):
         headers = dict(headers or {})
         headers["X-Arcade-Token"] = self.token
         return self._request("POST", path, headers=headers)
+
+    def test_accept_success_invokes_cli_without_mutating_metadata(self):
+        job_id = _job_id("a1b2")
+        job_dir = self._write_job(job_id, _job_meta(
+            job_id, mode="in-place", status="ok", ended=_iso_now(), land=None,
+            checkout="/checkout", commits=[{"sha": "old"}]))
+        meta_path = os.path.join(job_dir, "meta.json")
+        with open(meta_path, "rb") as f:
+            before = f.read()
+        with mock.patch.dict(os.environ, {"FAKE_FARMOUT_LOG": self.log_path}):
+            resp, data = self._post("/api/jobs/{}/accept".format(job_id))
+        self.assertEqual(200, resp.status)
+        self.assertEqual({"ok": True, "code": 0, "timed_out": False, "out": "", "err": ""}, data)
+        with open(self.log_path, encoding="utf-8") as f:
+            self.assertEqual([json.loads(line) for line in f], [{"argv": ["accept", job_id]}])
+        with open(meta_path, "rb") as f:
+            self.assertEqual(f.read(), before, "Python delegates metadata mutation to farmout")
+
+    def test_accept_bad_id_is_rejected_before_cli(self):
+        with mock.patch.dict(os.environ, {"FAKE_FARMOUT_LOG": self.log_path}):
+            resp, _ = self._post("/api/jobs/not-a-valid-id/accept")
+        self.assertEqual(resp.status, 400)
+        self.assertFalse(os.path.exists(self.log_path))
+
+    def test_accept_validation_exit_is_not_a_land_conflict(self):
+        for code in (2, 3):
+            with self.subTest(code=code), mock.patch.dict(os.environ, {
+                    "FAKE_FARMOUT_ACCEPT_EXIT": str(code),
+                    "FAKE_FARMOUT_STDERR": "in-place job required\n"}):
+                resp, data = self._post("/api/jobs/{}/accept".format(_job_id()))
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(data, {"ok": False, "code": code, "timed_out": False,
+                                    "out": "", "err": "in-place job required\n"})
+
+    def test_two_concurrent_accepts_share_the_job_action_lock(self):
+        job_id = _job_id("9999")
+        entered, release = threading.Event(), threading.Event()
+        original = server.ArcadeHandler._run_farmout
+        results = []
+
+        def held_run(handler, args):
+            entered.set()
+            release.wait(5)
+            return original(handler, args)
+
+        def first_request():
+            resp, _ = self._post("/api/jobs/{}/accept".format(job_id))
+            results.append(resp.status)
+
+        with mock.patch.dict(os.environ, {"FAKE_FARMOUT_LOG": self.log_path}), \
+                mock.patch.object(server.ArcadeHandler, "_run_farmout", held_run):
+            thread = threading.Thread(target=first_request)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(2), "accept did not reach the CLI seam")
+                resp, data = self._post("/api/jobs/{}/accept".format(job_id))
+                results.append(resp.status)
+                self.assertEqual(data, {"error": "another action is running on this job"})
+            finally:
+                release.set()
+                thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(sorted(results), [200, 409])
+        with open(self.log_path, encoding="utf-8") as f:
+            self.assertEqual([json.loads(line) for line in f], [{"argv": ["accept", job_id]}])
 
     def test_land_success(self):
         resp, data = self._post("/api/jobs/{}/land".format(_job_id("a1b2")))
