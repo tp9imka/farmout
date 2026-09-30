@@ -149,12 +149,33 @@ owned_files() ( # repo treeish-or-empty pathspec...
   fi | perl -0ne '$paths{$_}=1; END { print sort keys %paths }'
 )
 
+valid_owned_pathspecs_json() { # one nonempty array of nonempty, NUL-free strings
+  printf '%s' "$1" | jq -se 'length == 1 and (.[0] |
+    if type == "array" then length > 0 and all(.[];
+      if type == "string" then length > 0 and (contains("\u0000") | not) else false end)
+    else false end)' >/dev/null 2>&1
+}
+
+read_owned_pathspecs() { # owns-json -> OWNED_PATHS array
+  OWNED_PATHS=()
+  valid_owned_pathspecs_json "$1" \
+    || { echo 'farmout: invalid ownership pathspecs JSON; expected a nonempty array of pathspec strings' >&2; return 2; }
+  local path complete=false
+  # Empty pathspecs are invalid, so an extra empty NUL record is an unambiguous
+  # completion marker. Process-substitution failures must not look like an
+  # empty pathspec list (which Git interprets as all tracked files).
+  while IFS= read -r -d '' path; do
+    if [ -z "$path" ]; then complete=true; else OWNED_PATHS+=("$path"); fi
+  done < <(printf '%s' "$1" | jq -j '.[] | ., "\u0000"' && printf '\0')
+  $complete || { echo 'farmout: could not decode ownership pathspecs JSON; refusing ownership check' >&2; return 2; }
+  return 0
+}
+
 owned_files_json() ( # repo owns-json
-  local repo="$1" owns_json="$2" path paths=()
-  while IFS= read -r -d '' path; do paths+=("$path"); done \
-    < <(printf '%s' "$owns_json" | jq -j '.[] | ., "\u0000"')
+  local repo="$1" owns_json="$2"
+  read_owned_pathspecs "$owns_json" || return 2
   set -o pipefail
-  owned_files "$repo" '' "${paths[@]}" | jq -Rs 'split("\u0000") | .[:-1]'
+  owned_files "$repo" '' "${OWNED_PATHS[@]}" | jq -Rs 'split("\u0000") | .[:-1]'
 )
 
 # Return 2 for a live admitted owner, 3 for a live claimed owner. Claimed
@@ -196,12 +217,11 @@ in_place_overlap_guard() { # id repo owns-json [admitted-only]
 }
 
 in_place_admission_guard() { # jobdir
-  local job="$1" repo source_branch allow_default path owns_json owns=()
+  local job="$1" repo source_branch allow_default owns_json
   repo="$(meta_get "$job" checkout)"; source_branch="$(meta_get "$job" source_branch)"
   allow_default="$(meta_get "$job" allow_default_branch)"; owns_json="$(meta_get "$job" owns)"
-  while IFS= read -r -d '' path; do owns+=("$path"); done \
-    < <(printf '%s' "$owns_json" | jq -j '.[] | ., "\u0000"')
-  in_place_preflight "$repo" "$source_branch" "$allow_default" "${owns[@]}" || return 2
+  read_owned_pathspecs "$owns_json" || return 2
+  in_place_preflight "$repo" "$source_branch" "$allow_default" "${OWNED_PATHS[@]}" || return 2
   in_place_overlap_guard "$(basename "$job")" "$repo" "$owns_json"
 }
 
@@ -526,9 +546,16 @@ cmd_run() {
     repo="$scratch"
   fi
   local source_branch; source_branch="$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null)"
+  local owns_json='[]'
   if $in_place; then
+    # Serialize once before claiming anything, then reuse the checked JSON for
+    # both overlap and metadata. `--` protects valid leading-dash pathspecs.
+    owns_json="$(jq -n '$ARGS.positional' --args -- "${owns[@]}")" \
+      || die 'could not serialize ownership pathspecs; refusing in-place launch'
+    valid_owned_pathspecs_json "$owns_json" \
+      || die 'invalid ownership pathspecs JSON from serialization; refusing in-place launch'
     in_place_preflight "$repo" "$source_branch" "$allow_default" "${owns[@]}" || exit 2
-    in_place_overlap_guard '' "$repo" "$(jq -n '$ARGS.positional' --args "${owns[@]}")" admitted-only || exit 2
+    in_place_overlap_guard '' "$repo" "$owns_json" admitted-only || exit 2
   fi
 
   # The worker runs in a separate worktree; an absolute path into the source
@@ -618,7 +645,7 @@ cmd_run() {
     --arg source_branch "$source_branch" --arg parent_session "${CLAUDE_CODE_SESSION_ID:-}" \
     --arg parent_pid "${CLAUDE_PID:-}" \
     --arg base_ref "$ref" --arg scratch "$scratch" \
-    --argjson owns "$(jq -n '$ARGS.positional' --args ${owns[@]+"${owns[@]}"})" \
+    --argjson owns "$owns_json" \
     --argjson allow_default "$allow_default" \
     --argjson out_globs "$(if [ ${#out_globs[@]} -gt 0 ]; then printf '%s\n' "${out_globs[@]}" | jq -R . | jq -cs .; else echo null; fi)" \
     '{id:$id, cli:$cli, mode:$mode, repo:$repo, base:$base, out_globs:$out_globs,

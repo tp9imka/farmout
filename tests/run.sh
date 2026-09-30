@@ -117,6 +117,90 @@ test_in_place_allows_disjoint_owns() {
   stop_in_place_holder first "$runner"
 }
 
+test_in_place_owns_leading_dash_pathspec() {
+  make_feature_branch
+  printf '%s\n' tracked > "$REPO/-odd.txt"
+  git -C "$REPO" add -- -odd.txt
+  git -C "$REPO" -c user.name=t -c user.email=t@t commit -qm 'leading dash path'
+  start_in_place_holder ordinary a.txt; local runner="$HOLDER_RUNNER"
+  local index; index="$(git hash-object "$REPO/.git/index")"
+  brief 'FAKE: print ok'; run_job fake --in-place --owns -odd.txt
+  assert_eq "$RC" 0 "$ERR"
+  assert_eq "$(jq -c .owns "$FARMOUT_HOME/jobs/$ID/meta.json")" '["-odd.txt"]'
+  assert_eq "$(git hash-object "$REPO/.git/index")" "$index"
+  stop_in_place_holder ordinary "$runner"
+  start_in_place_holder dashed -odd.txt; runner="$HOLDER_RUNNER"
+  run_job fake --in-place --owns -odd.txt
+  assert_eq "$RC" 2 "$ERR"
+  assert_contains "$ERR" 'ownership overlaps live in-place job dashed'
+  assert_contains "$ERR" 'untracked-only future files cannot be detected'
+  assert_eq "$(git hash-object "$REPO/.git/index")" "$index"
+  stop_in_place_holder dashed "$runner"
+}
+
+test_in_place_ownership_serialization_failure_is_safe() {
+  make_feature_branch; brief 'FAKE: print must-not-run'
+  local index head payload
+  index="$(git hash-object "$REPO/.git/index")"; head="$(git -C "$REPO" rev-parse HEAD)"
+  # Inject only the ownership serializer; all validation/other jq calls use
+  # the real executable. Exported functions work with the target Bash 3.2.
+  jq() {
+    local arg
+    for arg in "$@"; do
+      if [ "$arg" = '$ARGS.positional' ]; then
+        [ "$FAKE_JQ_OWNS_PAYLOAD" != fail ] || return 7
+        printf '%s' "$FAKE_JQ_OWNS_PAYLOAD"; return 0
+      fi
+    done
+    command jq "$@"
+  }
+  export -f jq
+  for payload in fail '' null '[]' '{}' '[42]' '[""]' '["a.txt"] ["a.txt"]' invalid-json; do
+    export FAKE_JQ_OWNS_PAYLOAD="$payload"
+    run_job fake --in-place --owns a.txt
+    assert_eq "$RC" 2 "serialization payload [$payload]: $ERR"
+    assert_contains "$ERR" 'ownership pathspecs'
+    [ ! -d "$FARMOUT_HOME/jobs" ] || fail 'claimed a job after failed ownership serialization'
+    [ -z "$OUT" ] || fail 'launched a worker after failed ownership serialization'
+    assert_eq "$(git hash-object "$REPO/.git/index")" "$index"
+    assert_eq "$(git -C "$REPO" rev-parse HEAD)" "$head"
+  done
+}
+
+test_in_place_refuses_invalid_live_ownership_json() {
+  make_feature_branch; track_in_place_paths
+  local bad="$FARMOUT_HOME/jobs/invalid-owner" index
+  mkdir -p "$bad"
+  jq -n --arg r "$REPO" --argjson pid "$$" \
+    '{mode:"in-place",checkout:$r,owns:42,admitted:true,status:"running",sup_pid:$pid}' > "$bad/meta.json"
+  index="$(git hash-object "$REPO/.git/index")"
+  brief 'FAKE: print must-not-run'; run_job fake --in-place --owns c.txt
+  assert_eq "$RC" 2 "$ERR"
+  assert_contains "$ERR" 'invalid ownership pathspecs JSON'
+  assert_contains "$ERR" 'invalid-owner'
+  assert_eq "$(ls "$FARMOUT_HOME/jobs" | wc -l | tr -d ' ')" 1 'claimed a job despite invalid peer ownership'
+  assert_eq "$(git hash-object "$REPO/.git/index")" "$index"
+}
+
+test_in_place_ownership_decoder_failure_is_safe() {
+  make_feature_branch; brief 'FAKE: print must-not-run'
+  local index; index="$(git hash-object "$REPO/.git/index")"
+  jq() {
+    local arg
+    for arg in "$@"; do
+      if [ "$arg" = '.[] | ., "\u0000"' ]; then return 7; fi
+    done
+    command jq "$@"
+  }
+  export -f jq
+  run_job fake --in-place --owns a.txt
+  assert_eq "$RC" 2 "$ERR"
+  assert_contains "$ERR" 'could not decode ownership pathspecs JSON'
+  [ ! -d "$FARMOUT_HOME/jobs" ] || fail 'claimed a job after failed ownership decoding'
+  [ -z "$OUT" ] || fail 'launched a worker after failed ownership decoding'
+  assert_eq "$(git hash-object "$REPO/.git/index")" "$index"
+}
+
 test_in_place_ownership_uses_git_magic_and_nul_paths() {
   make_feature_branch; track_in_place_paths
   local unusual=$'odd\nname.txt'
