@@ -2,11 +2,73 @@
 # Real-subscription smoke: read/write per adapter, plus Codex/Kiro in-place.
 # Spends a few requests per CLI. Usage: tests/smoke-real.sh [cli...]
 # --dry-run-in-place [codex kiro] shows the disposable fixture and launch only.
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/.." && pwd -P)" || exit 1
 FARMOUT="$ROOT/bin/farmout"
-T="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/farmout-smoke.XXXXXX")" && pwd -P)"
-trap 'if [ "${FARMOUT_SMOKE_KEEP:-0}" = 1 ]; then echo "smoke artifacts: $T"; else rm -rf "$T"; fi' EXIT
+# Non-destructive regression: intercept cleanup/fixture operations before
+# injecting failed allocation. Even broken allocation must never delete data.
+if [ "${1:-}" = --test-temp-allocation ]; then
+  allocation_out="$( (
+    mktemp() { echo 'injected mktemp failure' >&2; return 1; }
+    trap() { echo 'FAIL cleanup installed' >&2; exit 99; }
+    mkdir() { echo 'FAIL fixture created' >&2; exit 98; }
+    rm() { echo 'FAIL deletion attempted' >&2; exit 97; }
+    source "$ROOT/tests/smoke-real.sh" --allocate-temp-only
+  ) 2>&1)"
+  allocation_rc=$?
+  if [ "$allocation_rc" -eq 1 ] \
+    && printf '%s\n' "$allocation_out" | grep -q '^injected mktemp failure$' \
+    && ! printf '%s\n' "$allocation_out" | grep -q '^FAIL'; then
+    echo 'ok   failed allocation exits before cleanup or fixtures'
+    exit 0
+  fi
+  printf 'FAIL allocation guard: exit=%s output=[%s]\n' "$allocation_rc" "$allocation_out"
+  exit 1
+fi
+cleanup_smoke() {
+  local target="${T:-}" resolved
+  # Immutable allocation anchors are independent of mutable worker variables.
+  # Refuse any target other than the exact canonical directory we allocated.
+  if [ -z "$target" ] || [ "$target" = / ] || [ "$target" != "$SMOKE_TEMP_ROOT" ] \
+    || [ "$target" = "$SMOKE_SOURCE_ROOT" ] || [ "$target" = "$SMOKE_START_CWD" ] \
+    || [ "$target" = "$(pwd -P)" ]; then
+    echo 'FAIL refusing unsafe smoke cleanup target' >&2
+    return 1
+  fi
+  case "$target" in
+    "$SMOKE_TEMP_PARENT"/farmout-smoke.??????) ;;
+    *) echo 'FAIL refusing unvalidated smoke cleanup prefix' >&2; return 1 ;;
+  esac
+  [ ! -L "$target" ] || { echo 'FAIL refusing symlink smoke cleanup target' >&2; return 1; }
+  [ -e "$target" ] || return 0
+  resolved="$(cd "$target" && pwd -P)" || return 1
+  [ "$resolved" = "$SMOKE_TEMP_ROOT" ] \
+    || { echo 'FAIL refusing changed smoke cleanup target' >&2; return 1; }
+  if [ "${FARMOUT_SMOKE_KEEP:-0}" = 1 ]; then
+    echo "smoke artifacts: $target"
+  else
+    rm -rf -- "$target"
+  fi
+}
+
+SMOKE_START_CWD="$(pwd -P)" || exit 1
+SMOKE_SOURCE_ROOT="$ROOT"
+SMOKE_TEMP_PARENT="$(cd "${TMPDIR:-/tmp}" && pwd -P)" || exit 1
+TEMP_RAW="$(mktemp -d "$SMOKE_TEMP_PARENT/farmout-smoke.XXXXXX")" \
+  || { echo 'smoke: cannot allocate temporary directory' >&2; exit 1; }
+case "$TEMP_RAW" in
+  "$SMOKE_TEMP_PARENT"/farmout-smoke.??????) ;;
+  *) echo 'smoke: invalid temporary directory allocation' >&2; exit 1 ;;
+esac
+[ -n "$TEMP_RAW" ] && [ -d "$TEMP_RAW" ] && [ ! -L "$TEMP_RAW" ] \
+  || { echo 'smoke: missing or symlink temporary directory' >&2; exit 1; }
+T="$(cd "$TEMP_RAW" && pwd -P)" || exit 1
+[ "$T" = "$TEMP_RAW" ] && [ "$T" != / ] && [ "$T" != "$ROOT" ] && [ "$T" != "$SMOKE_START_CWD" ] \
+  || { echo 'smoke: unsafe temporary directory' >&2; exit 1; }
+SMOKE_TEMP_ROOT="$T"
+readonly SMOKE_TEMP_ROOT SMOKE_TEMP_PARENT SMOKE_SOURCE_ROOT SMOKE_START_CWD
+trap cleanup_smoke EXIT
 export FARMOUT_HOME="$T/home"
+[ "${1:-}" != --allocate-temp-only ] || exit 0
 source_state() {
   GIT_OPTIONAL_LOCKS=0 git -C "$ROOT" rev-parse HEAD
   GIT_OPTIONAL_LOCKS=0 git -C "$ROOT" symbolic-ref --quiet HEAD
