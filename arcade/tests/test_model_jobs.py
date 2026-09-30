@@ -1065,6 +1065,48 @@ class BackgroundFilesTest(ModelJobsTestCase):
         self.assertEqual(rec["files"], [{"n": "final.py", "a": 8, "d": 1}])
         self.assertIsNone(rec["commits"][0]["available"])
 
+    def test_two_step_finalization_rechecks_changed_commits_and_checkout_immediately(self):
+        meta = _base_meta("j1", mode="in-place", status="ok", checkout="/checkout",
+                          ended=_iso(2026, 9, 23, 14, 30, 0), commits=[])
+        job_dir = _write_job(self.home, "j1", meta=meta)
+        git = mock.Mock(return_value="")
+        # Drive refresher passes manually so no scheduling race can hide
+        # the pending state between a metadata write and its measurement.
+        with mock.patch.object(model_jobs.JobsModel, "_refresh_loop", return_value=None):
+            model = self._model(git)
+        model.snapshot(NOW_MS, 60)
+        model._refresh_due()
+        self.assertEqual(model._files_cache["j1"]["commits"], [])
+
+        commit = {"sha": "end", "subject": "finished", "files": [
+            {"path": "final.py", "added": 8, "deleted": 1}]}
+        meta["commits"] = [commit]
+        with open(os.path.join(job_dir, "meta.json"), "w") as f:
+            json.dump(meta, f)
+        model._files_wake.clear()
+        rec = model.snapshot(NOW_MS, 60)["jobs"][0]
+        self.assertEqual(rec["files"], [{"n": "final.py", "a": 8, "d": 1}])
+        self.assertEqual(rec["commits"], [dict(commit, available=None)])
+        git.assert_not_called()
+        self.assertTrue(model._files_wake.is_set(), "changed commits must wake the refresher immediately")
+        model._refresh_due()
+        self.assertTrue(model.snapshot(NOW_MS, 60)["jobs"][0]["commits"][0]["available"])
+        self.assertEqual(git.call_args_list, [mock.call(["cat-file", "-e", "end^{commit}"], "/checkout"),
+                                             mock.call(["merge-base", "--is-ancestor", "end", "HEAD"], "/checkout")])
+
+        meta["checkout"] = "/changed-checkout"
+        with open(os.path.join(job_dir, "meta.json"), "w") as f:
+            json.dump(meta, f)
+        model._files_wake.clear()
+        rec = model.snapshot(NOW_MS, 60)["jobs"][0]
+        self.assertEqual(rec["commits"], [dict(commit, available=None)])
+        self.assertEqual(git.call_count, 2, "snapshot must not run the new Git measurement inline")
+        self.assertTrue(model._files_wake.is_set(), "changed checkout must wake the refresher immediately")
+        git.return_value = None
+        model._refresh_due()
+        self.assertFalse(model.snapshot(NOW_MS, 60)["jobs"][0]["commits"][0]["available"])
+        self.assertEqual(git.call_args, mock.call(["cat-file", "-e", "end^{commit}"], "/changed-checkout"))
+
     def test_refresher_result_is_served_on_the_next_snapshot(self):
         def fake_git(args, cwd):
             return "2\t1\tsrc.txt\n" if args[0] == "diff" else ""

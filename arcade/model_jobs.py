@@ -236,7 +236,7 @@ class JobsModel(object):
 
         # Shared with the refresher thread; guarded by _files_lock.
         # _files_wanted: job_id -> spec tuple from the latest snapshot.
-        # _files_cache: job_id -> {"final", "at", "files", "commits", "refresh"}.
+        # _files_cache: job_id -> {"spec", "final", "at", "files", "commits", "refresh"}.
         self._files_lock = threading.Lock()
         self._files_wanted = {}
         self._files_cache = {}
@@ -534,7 +534,8 @@ class JobsModel(object):
             return commits
         with self._files_lock:
             cached = self._files_cache.get(job_id)
-            measured = cached.get("commits") if cached else None
+            measured = (cached.get("commits") if cached and
+                        cached["spec"] == self._files_wanted.get(job_id) else None)
         if measured is not None:
             return measured
         return [dict(commit, available=None) for commit in commits if isinstance(commit, dict)]
@@ -544,11 +545,12 @@ class JobsModel(object):
         return self._cached_files(job_id, spec)
 
     def _cached_files(self, job_id, spec):
-        is_ended = spec[4]
         with self._files_lock:
             self._files_wanted[job_id] = spec
             cached = self._files_cache.get(job_id)
-            due = self._files_due(cached, is_ended)
+            if spec[5] == IN_PLACE_MODE and cached and cached["spec"] != spec:
+                cached = None
+            due = self._files_due(cached, spec)
         if due:
             if self._background:
                 self._files_wake.set()
@@ -558,12 +560,12 @@ class JobsModel(object):
                     cached = self._files_cache.get(job_id)
         return cached["files"] if cached else None
 
-    def _files_due(self, cached, is_ended):
-        if cached is None:
+    def _files_due(self, cached, spec):
+        if cached is None or (spec[5] == IN_PLACE_MODE and cached["spec"] != spec):
             return True
         if cached["final"]:
             return cached.get("refresh", False) and self._clock() - cached["at"] >= FILES_REFRESH_S
-        return is_ended or self._clock() - cached["at"] >= FILES_REFRESH_S
+        return spec[4] or self._clock() - cached["at"] >= FILES_REFRESH_S
 
     def _measure_files(self, job_id, spec):
         job_dir, worktree, base, repo, is_ended = spec[:5]
@@ -581,7 +583,7 @@ class JobsModel(object):
         with self._files_lock:
             # A job pruned while git ran must not be resurrected.
             if self._files_wanted.get(job_id) == spec:
-                self._files_cache[job_id] = {"final": is_ended, "at": self._clock(), "files": files,
+                self._files_cache[job_id] = {"spec": spec, "final": is_ended, "at": self._clock(), "files": files,
                                             "commits": commits, "refresh": spec[5] == IN_PLACE_MODE}
 
     def _commits_from_checkout(self, checkout, stored):
@@ -601,7 +603,7 @@ class JobsModel(object):
     def _refresh_due(self):
         with self._files_lock:
             due = [(job_id, spec) for job_id, spec in self._files_wanted.items()
-                   if self._files_due(self._files_cache.get(job_id), spec[4])]
+                   if self._files_due(self._files_cache.get(job_id), spec)]
         for job_id, spec in due:
             if self._closed.is_set():
                 return
