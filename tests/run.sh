@@ -53,6 +53,43 @@ wait_for_meta_pid() { # id
 
 make_feature_branch() { git -C "$REPO" branch -M feature/in-place-test; }
 
+test_in_place_adapter_argument_preserves_trailing_newlines() {
+  . "$ROOT/lib/common.sh"; . "$ROOT/lib/adapters.sh"
+  local job="$T/argv-job" cli arg found
+  local text=$'BRIEF TEXT\n\n\n'
+  mkdir -p "$job"; printf '%s' "$text" > "$job/brief.md"
+  printf '{}\n' > "$job/meta.json"
+  for cli in codex kiro copilot cursor fake; do
+    _adapter_build_argv "$cli" "$job" '/checkout with spaces' model high
+    found=false
+    for arg in "${ADAPTER_ARGV[@]}"; do
+      [ "$arg" = "$text" ] && found=true
+    done
+    $found || fail "$cli adapter stripped trailing newlines from the actual brief argument"
+  done
+}
+
+test_in_place_refuses_untracked_owned_path_when_status_hides_it() {
+  make_feature_branch
+  git -C "$REPO" config status.showUntrackedFiles no
+  printf '%s\n' 'user-owned untracked work' > "$REPO/user-new.txt"
+  brief 'FAKE: print ok'; run_job fake --in-place --owns user-new.txt
+  assert_eq "$RC" 2 "$ERR"
+  assert_contains "$ERR" user-new.txt
+  [ ! -d "$FARMOUT_HOME/jobs" ] || fail 'claimed a job before untracked-file refusal'
+}
+
+test_in_place_preflight_preserves_clean_index_bytes() {
+  make_feature_branch
+  local index="$REPO/.git/index" before
+  before="$(git hash-object "$index")"
+  # Same contents, different stat information: ordinary status refreshes it.
+  touch -t 200001010000 "$REPO/a.txt"
+  brief 'FAKE: print ok'; run_job fake --in-place --owns a.txt
+  assert_eq "$RC" 0 "$ERR"
+  assert_eq "$(git hash-object "$index")" "$before" 'preflight rewrote clean index bytes'
+}
+
 test_in_place_never_runs_best_effort_commit() {
   # Verify the supervisor's stage/commit commands stay inside mode=write.
   awk '
@@ -155,7 +192,7 @@ test_in_place_branch_switch_fails() {
 
 test_in_place_brief_verbatim() {
   make_feature_branch
-  printf '%s\n' 'FAKE: echo-brief' "say \"hi\" \$HOME \`uname\` it's" '' 'last line' > "$T/brief.md"
+  printf '%s\n' 'FAKE: echo-brief' "say \"hi\" \$HOME \`uname\` it's" '' 'last line' '' '' > "$T/brief.md"
   run_job fake --in-place --owns a.txt --owns 'space file.txt'
   assert_eq "$RC" 0 "$ERR"
   local r="$FARMOUT_HOME/jobs/$ID/brief.md"
@@ -176,6 +213,9 @@ EOF
 )"
   assert_eq "$(head -7 "$r")" "$expected" exact-preamble
   cmp -s "$T/brief.md" <(tail -c "$(wc -c < "$T/brief.md")" "$r") || fail 'brief not passed verbatim'
+  # echo-brief prints the exact worker argument plus one printf newline.
+  cmp -s <(cat "$r"; printf '\n') "$FARMOUT_HOME/jobs/$ID/result.md" \
+    || fail 'actual worker brief argument lost trailing blank lines'
 }
 
 test_in_place_owns_must_be_repo_relative() {
@@ -962,12 +1002,14 @@ test_read_job_leaves_checkout_untouched() {
 }
 
 test_brief_verbatim() {
-  printf '%s\n' 'FAKE: echo-brief' "say \"hi\" \$HOME \`uname\` it's" '' 'last line' > "$T/brief.md"
+  printf '%s\n' 'FAKE: echo-brief' "say \"hi\" \$HOME \`uname\` it's" '' 'last line' '' '' > "$T/brief.md"
   run_job fake
   # The worker gets farmout's ground rules first, then the brief byte for byte.
-  local r="$FARMOUT_HOME/jobs/$ID/result.md"
+  local r="$FARMOUT_HOME/jobs/$ID/brief.md"
   head -1 "$r" | grep -q '^# Ground rules (added by farmout)' || fail "ground rules missing"
   cmp -s "$T/brief.md" <(tail -c "$(wc -c < "$T/brief.md")" "$r") || fail "brief not passed verbatim"
+  cmp -s <(cat "$r"; printf '\n') "$FARMOUT_HOME/jobs/$ID/result.md" \
+    || fail 'actual worker brief argument lost trailing blank lines'
 }
 
 test_launch_prints_repo_and_quiet_untracked() {

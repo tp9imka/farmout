@@ -43,7 +43,8 @@ adapter_effective_effort() { # cli model effort
 # must not call it again.
 _adapter_build_argv() { # cli jobdir workdir model effort
   local cli="$1" job="$2" workdir="$3" model="$4" effort="$5" brief engine
-  brief="$(cat "$job/brief.md")"
+  # Command substitution trims trailing newlines; a sentinel retains them.
+  brief="$(cat "$job/brief.md"; printf x)"; brief="${brief%x}"
   ADAPTER_ARGV=()
   case "$cli" in
     codex)

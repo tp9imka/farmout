@@ -116,7 +116,7 @@ in_place_preflight() { # repo source_branch allow_default owns...
     return 2
   fi
   local dirty
-  dirty="$(git -C "$repo" status --porcelain -- "$@")" || { echo 'farmout: could not check owned paths' >&2; return 2; }
+  dirty="$(GIT_OPTIONAL_LOCKS=0 git -C "$repo" status --porcelain --untracked-files=all -- "$@")" || { echo 'farmout: could not check owned paths' >&2; return 2; }
   if [ -n "$dirty" ]; then
     printf 'farmout: owned paths are dirty; commit or stash your changes first:\n%s\n' "$dirty" >&2
     return 2
