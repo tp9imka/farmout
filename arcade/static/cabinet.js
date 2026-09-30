@@ -146,12 +146,22 @@ function NoSignal({ v }) {
     </div>`;
 }
 
+function Warming({ v }) {
+  return html`
+    <div style="position:relative; flex:1; min-height:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:22px; background:#141211; border:2px solid #2d2b2b; overflow:hidden; font-family:'Press Start 2P',monospace;">
+      <div style="font-size:40px; color:var(--color-accent); opacity:${v.blink};">WARMING UP</div>
+      <div style="font-family:var(--font-body); font-size:15px; color:var(--color-neutral-400);">Reading jobs and sessions for the first board.</div>
+      ${SCAN}
+    </div>`;
+}
+
 function Hof({ v }) {
   return html`
     <div style="flex:none; display:flex; flex-direction:column; gap:8px; padding:12px 14px 10px; background:#1a1817; border:2px solid #444141;">
       <div style="display:flex; align-items:center; gap:14px; font-family:'Press Start 2P',monospace; font-size:10px;">
         <div style="color:var(--color-accent);">HALL OF FAME</div>
         <div style="font-size:8px; color:var(--color-neutral-500);">LAST 10 FINISHED</div>
+        ${v.behind && html`<div title="The dashboard is still building a newer board; this one is older." style="margin-left:auto; font-size:8px; color:#f0a830; cursor:help;">${v.behind}</div>`}
       </div>
       <div style="display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); column-gap:28px;">
         ${v.hof.map(x => html`
@@ -172,6 +182,7 @@ export function Cabinet({ v }) {
     <div style="flex:1; min-height:0; display:flex; flex-direction:column; gap:10px; padding:10px;">
       ${v.dataLive && html`<${Live} v=${v} />`}
       ${v.dataEmpty && html`<${Empty} v=${v} />`}
+      ${v.warming && html`<${Warming} v=${v} />`}
       ${v.noSignal && html`<${NoSignal} v=${v} />`}
       ${!v.noSignal && html`<${Hof} v=${v} />`}
     </div>`;
