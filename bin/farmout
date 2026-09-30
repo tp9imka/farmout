@@ -25,7 +25,8 @@ usage_text() {
 farmout - hand a task to another coding-agent CLI (codex, kiro, copilot,
 cursor) in an isolated git worktree, then review and land its work.
 
-usage: farmout run <cli|auto> [--write] [--model M] [--effort E] [--kind K]
+usage: farmout run <cli|auto> [--write | --in-place --owns <pathspec>...]
+                    [--allow-default-branch] [--model M] [--effort E] [--kind K]
                     [--title T] [--timeout 30m] [--with <path>]... [--out <glob>]...
                     [--repo <path>] [--ref <rev>] [--no-repo] [--queue] --brief <file>
        farmout status [job]
@@ -82,14 +83,44 @@ first_sentence() { # text
 }
 
 remove_worktree() { # jobdir
-  local repo wt branch
+  local repo wt branch checkout owned_root resolved
+  [ "$(meta_get "$1" mode)" != in-place ] || return 0
   repo="$(meta_get "$1" repo)"; wt="$(meta_get "$1" worktree)"; branch="$(meta_get "$1" branch)"
-  [ -n "$wt" ] && [ -d "$wt" ] && git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1
+  checkout="$(meta_get "$1" checkout)"
+  [ -n "$wt" ] && [ "$wt" != "$checkout" ] || return 0
+  owned_root="$(cd "$FARMOUT_HOME/worktrees" 2>/dev/null && pwd -P)" || return 0
+  resolved="$(cd "$wt" 2>/dev/null && pwd -P)" || return 0
+  case "$resolved" in "$owned_root"/*) ;; *) return 0 ;; esac
+  git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1
   git -C "$repo" worktree prune >/dev/null 2>&1
   [ -n "$branch" ] && git -C "$repo" branch -D "$branch" >/dev/null 2>&1
   # A --no-repo job's scratch repo has no use once its worktree is gone.
   local scratch; scratch="$(meta_get "$1" scratch)"
   case "$scratch" in "$FARMOUT_HOME"/scratch/*) rm -rf "$scratch" ;; esac
+  return 0
+}
+
+in_place_preflight() { # repo source_branch allow_default owns...
+  local repo="$1" source_branch="$2" allow_default="$3"
+  shift 3
+  [ -n "$source_branch" ] || { echo 'farmout: --in-place refuses detached HEAD; check out a branch first' >&2; return 2; }
+  local default_branch
+  default_branch="$(git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)"
+  default_branch="${default_branch#origin/}"
+  if [ -z "$default_branch" ]; then
+    git -C "$repo" show-ref --verify --quiet refs/heads/main && default_branch=main
+    [ -n "$default_branch" ] || { git -C "$repo" show-ref --verify --quiet refs/heads/master && default_branch=master; }
+  fi
+  if [ "$source_branch" = "$default_branch" ] && [ "$allow_default" != true ]; then
+    echo "farmout: --in-place refuses default branch '$source_branch'; use a feature branch or --allow-default-branch" >&2
+    return 2
+  fi
+  local dirty
+  dirty="$(git -C "$repo" status --porcelain -- "$@")" || { echo 'farmout: could not check owned paths' >&2; return 2; }
+  if [ -n "$dirty" ]; then
+    printf 'farmout: owned paths are dirty; commit or stash your changes first:\n%s\n' "$dirty" >&2
+    return 2
+  fi
   return 0
 }
 
@@ -238,6 +269,12 @@ admit_job() { # id job max_jobs meta_json
 
     if [ "$overall" -lt "$max" ]; then
       admit_test_pause
+      if [ "$(meta_get "$job" mode)" = in-place ]; then
+        local admission_head
+        admission_head="$(git -C "$(meta_get "$job" checkout)" rev-parse HEAD)" \
+          || { rm -rf "$job"; die "could not read checkout HEAD at admission"; }
+        meta_set "$job" --arg head "$admission_head" '.base = $head'
+      fi
       # started = admission: a queued job's wait is not run time (elapsed,
       # the dashboard's stall clock and the timeout all count from here).
       meta_set "$job" --arg at "$(now_iso)" '.admitted = true | .admitted_at = $at | .queued_at = .started | .started = $at'
@@ -259,10 +296,14 @@ admit_job() { # id job max_jobs meta_json
 cmd_run() {
   local cli="${1:-}"; shift || true
   local write=false model="" effort="" timeout_flag="" title="" kind="" brief="" route=""
-  local with_paths=() out_globs=() repo_flag="" ref="" no_repo=false queue=false
+  local with_paths=() out_globs=() owns=() repo_flag="" ref="" no_repo=false queue=false
+  local in_place=false allow_default=false
   while [ $# -gt 0 ]; do
     case "$1" in
       --write) write=true ;;
+      --in-place) in_place=true; write=true ;;
+      --owns) [ -n "${2:-}" ] || usage; owns+=("$2"); shift ;;
+      --allow-default-branch) allow_default=true ;;
       --model) model="$2"; shift ;;
       --effort) effort="$2"; shift ;;
       --timeout) timeout_flag="$2"; shift ;;
@@ -279,6 +320,23 @@ cmd_run() {
     esac
     shift
   done
+  if $in_place; then
+    [ -z "$ref" ] && ! $no_repo && [ ${#with_paths[@]} -eq 0 ] && [ ${#out_globs[@]} -eq 0 ] \
+      || die "--in-place cannot be combined with --ref, --no-repo, --with or --out"
+    [ ${#owns[@]} -gt 0 ] || die "--in-place requires --owns <repo-relative pathspec>"
+    local owned relative
+    for owned in "${owns[@]}"; do
+      relative="$owned"
+      # Keep git pathspec magic, but validate the path after it as well.
+      case "$relative" in
+        ':('*')'*) relative="${relative#*)}" ;;
+        :*) relative="${relative#:}"; relative="${relative#\!}"; relative="${relative#^}"; relative="${relative#/}" ;;
+      esac
+      case "$relative" in ''|/*|..|../*|*/../*|*/..) die "--owns '$owned' must be a non-empty repo-relative pathspec, inside the repo" ;; esac
+    done
+  else
+    [ ${#owns[@]} -eq 0 ] && ! $allow_default || die "--owns and --allow-default-branch require --in-place"
+  fi
   [ "$cli" = auto ] || adapter_known "$cli" || die "unknown cli '$cli' (known: $ADAPTERS, or auto)"
   [ -n "$brief" ] && [ -f "$brief" ] || die "--brief <file> is required"
   # Read once, now: a queued job may wait a long time, and the brief file can
@@ -319,7 +377,10 @@ cmd_run() {
   # Where the snapshot comes from: --repo, else the cwd's repo. A job that
   # needs no code (--no-repo, or a research job run outside any repo) gets an
   # empty scratch repo, so every job keeps the same worktree code path.
-  local repo scratch=""
+  local repo scratch="" cwd_repo
+  if $in_place; then
+    cwd_repo="$(git rev-parse --show-toplevel 2>/dev/null)" || die "--in-place requires the current checkout"
+  fi
   if $no_repo; then
     [ -z "$repo_flag$ref" ] || die "--no-repo cannot be combined with --repo or --ref"
   elif [ -n "$repo_flag" ]; then
@@ -328,6 +389,11 @@ cmd_run() {
     [ "$kind" = research ] && [ -z "$ref" ] || die "not inside a git repository; refusing to run an auto-approved agent unisolated (use --repo, or --no-repo for a job that needs no code)"
     no_repo=true
   fi
+  if $in_place; then
+    [ "$(cd "$repo" && pwd -P)" = "$(cd "$cwd_repo" && pwd -P)" ] \
+      || die "--in-place --repo must point to the current checkout"
+    repo="$(cd "$cwd_repo" && pwd -P)"
+  fi
   if $no_repo; then
     $write && die "a job with no repo is read-only; hand files back with --out"
     [ ${#with_paths[@]} -eq 0 ] || die "--with needs a repo"
@@ -335,10 +401,11 @@ cmd_run() {
     repo="$scratch"
   fi
   local source_branch; source_branch="$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null)"
+  $in_place && { in_place_preflight "$repo" "$source_branch" "$allow_default" "${owns[@]}" || exit 2; }
 
   # The worker runs in a separate worktree; an absolute path into the source
   # checkout would let an auto-approved worker edit the source directly.
-  printf '%s' "$brief_text" | grep -qF "$repo/" \
+  ! $in_place && printf '%s' "$brief_text" | grep -qF "$repo/" \
     && die "brief contains the source checkout's absolute path ($repo/); use repo-relative paths - the worker runs in a separate worktree"
 
   # --out: files a read job hands back (reports); copied out before its
@@ -360,7 +427,9 @@ cmd_run() {
   # meta.json (below), so nothing here may die after claim_job_id.
   local snap untracked stash_rc head tree
   head="$(git -C "$repo" rev-parse HEAD 2>/dev/null)" || die "repository has no commits"
-  if [ -n "$ref" ]; then
+  if $in_place; then
+    snap="$head"; stash_rc=0
+  elif [ -n "$ref" ]; then
     # Exactly that commit: the working tree (dirty edits, branch) is ignored.
     head="$(git -C "$repo" rev-parse --verify --quiet "$ref^{commit}")" || die "--ref '$ref' is not a commit in $(basename "$repo")"
     snap="$head"; stash_rc=0
@@ -398,16 +467,19 @@ cmd_run() {
   fi
   untracked="$(git -C "$repo" ls-files --others --exclude-standard | wc -l | tr -d ' ')"
 
-  local id job wt mode branch
+  local id job wt mode branch workdir
   id="$(claim_job_id "$cli")" || die "could not claim a job id"
   job="$(job_dir "$id")"
   wt="$FARMOUT_HOME/worktrees/$(basename "$repo")-$id"
 
-  if $write; then
+  if $in_place; then
+    mode=in-place; branch=""; wt=""; workdir="$repo"
+  elif $write; then
     mode=write; branch="farmout/$cli-${id##*-}"
   else
     mode=read; branch=""
   fi
+  $in_place || workdir="$wt"
 
   local meta_json; meta_json="$(jq -n --arg id "$id" --arg cli "$cli" --arg mode "$mode" \
     --arg repo "$repo" --arg base "$snap" --arg branch "$branch" --arg wt "$wt" \
@@ -418,11 +490,12 @@ cmd_run() {
     --arg source_branch "$source_branch" --arg parent_session "${CLAUDE_CODE_SESSION_ID:-}" \
     --arg parent_pid "${CLAUDE_PID:-}" \
     --arg base_ref "$ref" --arg scratch "$scratch" \
+    --argjson owns "$(jq -n '$ARGS.positional' --args ${owns[@]+"${owns[@]}"})" \
     --argjson out_globs "$(if [ ${#out_globs[@]} -gt 0 ]; then printf '%s\n' "${out_globs[@]}" | jq -R . | jq -cs .; else echo null; fi)" \
     '{id:$id, cli:$cli, mode:$mode, repo:$repo, base:$base, out_globs:$out_globs,
       base_ref:(if $base_ref == "" then null else $base_ref end),
       scratch:(if $scratch == "" then null else $scratch end),
-      branch:(if $branch == "" then null else $branch end), worktree:$wt,
+      branch:(if $branch == "" then null else $branch end), worktree:(if $wt == "" then null else $wt end),
       pid:null, pgid:null, sup_pid:$sup, admitted:false, started:$started, ended:null, timeout_s:$timeout_s,
       status:"running", exit_code:null, untracked:$untracked, survivors:0,
       read_job_modified:false, land:null, error:null,
@@ -434,26 +507,33 @@ cmd_run() {
       route:(if $route == "" then null else $route end),
       source_branch:(if $source_branch == "" then null else $source_branch end),
       parent_session:(if $parent_session == "" then null else $parent_session end),
-      parent_pid:(if ($parent_pid|test("^[0-9]+$")) then ($parent_pid|tonumber) else null end)}')"
+      parent_pid:(if ($parent_pid|test("^[0-9]+$")) then ($parent_pid|tonumber) else null end)}
+      | if $mode == "in-place" then . + {checkout:$repo, owns:$owns, head_end:null, branch_end:null,
+          commits:[], unattributed:[], uncommitted:[], outside_owns:[]} else . end')"
 
   local max_jobs; max_jobs="$(cfg_limit max_jobs)"; [ -n "$max_jobs" ] || max_jobs="$DEFAULT_MAX_JOBS"
   if $queue; then admit_queued "$id" "$job" "$max_jobs" "$meta_json"
   else admit_job "$id" "$job" "$max_jobs" "$meta_json"
   fi
+  [ "$mode" != in-place ] || snap="$(meta_get "$job" base)"
 
   # The worktree (and everything else) is created only after admission.
-  mkdir -p "$FARMOUT_HOME/worktrees"
+  $in_place || mkdir -p "$FARMOUT_HOME/worktrees"
   # Every brief opens with the isolation rule: the worktree is the boundary
   # only while the worker stays in it, and a worker handed the wrong repo will
   # otherwise go and find the right one - the user's live checkout.
-  { printf '%s\n' "$BRIEF_PREAMBLE"; printf '%s' "$brief_text"; } > "$job/brief.md"
+  {
+    if $in_place; then IN_PLACE_BRIEF_PREAMBLE "$source_branch" "${owns[@]}"
+    else printf '%s\n' "$BRIEF_PREAMBLE"; fi
+    printf '%s' "$brief_text"
+  } > "$job/brief.md"
 
   echo "$id"
   echo "farmout: $id repo=$(basename "$repo") base=$(printf '%.7s' "$snap") mode=$mode${ref:+ ref=$ref}${scratch:+ (scratch)}" >&2
   # Untracked files matter only when the brief relies on one; a bare count is
   # the normal state of many repos and trains the reader to ignore it.
   local u
-  if [ "$untracked" -gt 0 ]; then
+  if ! $in_place && [ "$untracked" -gt 0 ]; then
     while IFS= read -r u; do
       [ -n "$u" ] && printf '%s' "$brief_text" | grep -qF -- "$u" && ! printf '%s\n' ${with_paths[@]+"${with_paths[@]}"} | grep -qxF -- "$u" \
         && warn "the brief names untracked '$u', which is not in the worker's snapshot (pass it with --with)"
@@ -461,7 +541,9 @@ cmd_run() {
   fi
 
   # meta.json now exists no matter what happens next (fixes leaked job dirs).
-  if $write; then
+  if $in_place; then
+    :
+  elif $write; then
     git -C "$repo" worktree add -q -b "$branch" "$wt" "$snap"
   else
     git -C "$repo" worktree add -q --detach "$wt" "$snap"
@@ -472,7 +554,7 @@ cmd_run() {
   }
 
   # Share the repo's own cargo target unless the repo already pins one (disk incident, 2026-09).
-  if [ -f "$wt/Cargo.toml" ] && [ -z "${CARGO_TARGET_DIR:-}" ] \
+  if ! $in_place && [ -f "$wt/Cargo.toml" ] && [ -z "${CARGO_TARGET_DIR:-}" ] \
      && ! grep -qs 'target-dir' "$repo/.cargo/config.toml" "$repo/.cargo/config"; then
     export CARGO_TARGET_DIR="$repo/target"
   fi
@@ -484,7 +566,7 @@ cmd_run() {
   local pid=""
   trap 'touch "$job/kill.requested"; [ -n "$pid" ] && kill_group "$pid"' TERM INT HUP
 
-  ( cd "$wt" && exec perl -e 'setpgrp(0, 0); exec @ARGV' "$SELF" _exec "$cli" "$job" "$wt" "$model" "$effort_final" ) \
+  ( cd "$workdir" && exec perl -e 'setpgrp(0, 0); exec @ARGV' "$SELF" _exec "$cli" "$job" "$workdir" "$model" "$effort_final" ) \
     </dev/null >"$job/log" 2>&1 &
   pid=$!
   meta_set "$job" --argjson p "$pid" '.pid = $p | .pgid = $p'
@@ -548,6 +630,14 @@ cmd_run() {
       cd "$wt" && { git diff --cached --quiet || git -c user.name=farmout -c user.email=farmout@localhost \
         commit -q --no-verify -m "farmout $id"; }
     ) >/dev/null 2>&1
+  elif [ "$mode" = in-place ]; then
+    local branch_end; branch_end="$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null)"
+    meta_set "$job" --arg head "$(git -C "$repo" rev-parse HEAD)" --arg branch "$branch_end" \
+      '.head_end = $head | .branch_end = (if $branch == "" then null else $branch end)'
+    if [ "$branch_end" != "$source_branch" ]; then
+      status=failed
+      worker_error="worker switched branch from '$source_branch' to '${branch_end:-detached HEAD}'"
+    fi
   else
     [ -n "$(meta_get "$job" out_globs)" ] && collect_out "$job" "$wt"
     local modified=false
@@ -678,6 +768,21 @@ BRIEF_PREAMBLE='# Ground rules (added by farmout)
 - If this copy does not match what the brief describes (paths or files missing), stop and report that as your first finding. Do not go looking for the "right" repository.
 '
 
+IN_PLACE_BRIEF_PREAMBLE() { # source_branch owns...
+  local source_branch="$1" paths="" p quoted; shift
+  for p in "$@"; do
+    printf -v quoted '%q' "$p"
+    paths="${paths}${paths:+ }$quoted"
+  done
+  printf '%s\n' '# Ground rules (added by farmout)'
+  printf -- "- Your working directory is the user's live checkout, on branch %s. Other agents may be working in this same checkout at the same time. It is not a copy: every change is real.\n" "$source_branch"
+  printf '%s\n' "- You own only these paths: $paths. Edit nothing else. If the task needs a file outside them, stop and say so in your final message."
+  printf '%s\n' "- Commit your own paths by name: \`git add $paths\` then \`git commit -m \"<msg>\" -- $paths\`. Never \`git add -A\`, \`git add .\`, \`git add -u\` or \`git commit -a\`."
+  printf '%s\n' '- Never `checkout`/`switch` a branch, `stash`, `reset`, `rebase`, `merge`, `pull`, `push`, `commit --amend`, `clean`, or `restore` a path you did not change. Leave other agents'"'"' uncommitted changes alone.'
+  printf '%s\n' '- If git reports that `index.lock` exists, wait a few seconds and retry. Never delete the lock.'
+  printf '%s\n\n' '- If this checkout does not match what the brief describes, stop and report that as your first finding.'
+}
+
 # Outcome ledger: one JSON line per finished job, plus one per review rating.
 # Lives outside jobs/ so `clean` never erases the history `scores` reads.
 OUTCOMES="$FARMOUT_HOME/outcomes.jsonl"
@@ -752,6 +857,8 @@ cmd_kill() {
 
 cmd_land() {
   require_job "$1"
+  [ "$(meta_get "$JOB" mode)" != in-place ] \
+    || die "in-place job; its commits are already on $(meta_get "$JOB" source_branch) - use farmout accept $1"
   [ "$(meta_get "$JOB" mode)" = write ] || die "job $1 is read-only; nothing to land"
   [ "$(effective_status "$JOB")" = ok ] || die "job $1 status is $(effective_status "$JOB"); only ok jobs land"
   [ -z "$(meta_get "$JOB" land)" ] || die "job $1 already $(meta_get "$JOB" land)"
@@ -774,6 +881,10 @@ cmd_land() {
 
 cmd_discard() {
   require_job "$1"
+  if [ "$(meta_get "$JOB" mode)" = in-place ]; then
+    local commits; commits="$(jq -r '[.commits[]?.sha] | join(" ")' "$JOB/meta.json")"
+    die "in-place commits are on your branch; revert them with git if you reject the lane: git revert ${commits:-<sha...>}"
+  fi
   local es; es="$(effective_status "$JOB")"
   [ "$es" != running ] || die "job $1 is running; kill it first"
   [ "$(meta_get "$JOB" land)" != landed ] || die "job $1 already landed"
@@ -820,7 +931,7 @@ cmd_clean() {
       continue
     fi
     [ "$es" = lost ] && kill_group "$(meta_get "$d" pgid)"
-    remove_worktree "$d"
+    [ "$mode" = in-place ] || remove_worktree "$d"
     rm -rf "$d"; n=$((n + 1))
   done
   echo "removed $n job(s)"

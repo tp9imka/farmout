@@ -51,6 +51,236 @@ wait_for_meta_pid() { # id
 
 # ---- lib -------------------------------------------------------------------
 
+make_feature_branch() { git -C "$REPO" branch -M feature/in-place-test; }
+
+test_in_place_never_runs_best_effort_commit() {
+  # Verify the supervisor's stage/commit commands stay inside mode=write.
+  awk '
+    /^  if \[ "\$mode" = write \]; then/ { write_block=1 }
+    /^  (elif|else|fi)/ { write_block=0 }
+    /git -C "\$wt" add -A|commit -q --no-verify -m "farmout \$id"/ {
+      if (!write_block) exit 1
+      seen++
+    }
+    END { if (seen != 2) exit 1 }
+  ' "$ROOT/bin/farmout" || fail 'supervisor staging/commit escaped mode=write'
+  make_feature_branch
+  local head; head="$(git -C "$REPO" rev-parse HEAD)"
+  brief 'FAKE: write a.txt worker-left-uncommitted' 'FAKE: print done'
+  run_job fake --in-place --owns a.txt
+  assert_eq "$RC" 0 "$ERR"
+  assert_eq "$(git -C "$REPO" rev-parse HEAD)" "$head"
+  assert_eq "$(git -C "$REPO" diff --cached)" ''
+  assert_contains "$(git -C "$REPO" status --porcelain)" ' M a.txt'
+  [ ! -e "$FARMOUT_HOME/jobs/$ID/diff.patch" ] || fail 'captured an in-place patch'
+}
+
+test_in_place_allows_absolute_checkout_path_in_brief() {
+  make_feature_branch
+  brief "Read $REPO/a.txt." 'FAKE: print ok'
+  run_job fake --in-place --owns a.txt
+  assert_eq "$RC" 0 "$ERR"
+}
+
+test_remove_worktree_refuses_unowned_write_meta() {
+  local linked="$T/linked"; git -C "$REPO" worktree add -q -b linked-test "$linked"
+  local job="$FARMOUT_HOME/jobs/manual"; mkdir -p "$job" "$FARMOUT_HOME/worktrees"
+  jq -n --arg r "$REPO" --arg c "$linked" \
+    '{mode:"write",repo:$r,worktree:$c,branch:"linked-test"}' > "$job/meta.json"
+  "$FARMOUT" discard manual >/dev/null
+  [ -d "$linked" ] || fail 'discard removed an unowned linked worktree'
+  git -C "$REPO" show-ref --verify --quiet refs/heads/linked-test || fail 'discard deleted an unowned branch'
+}
+
+test_in_place_allows_explicit_current_repo() {
+  make_feature_branch; brief 'FAKE: print ok'
+  run_job fake --in-place --owns a.txt --repo "$REPO"
+  assert_eq "$RC" 0 "$ERR"
+}
+
+start_queued_in_place() {
+  printf '%s\n' '{"limits":{"max_jobs":1}}' > "$FARMOUT_CONFIG"
+  mkdir -p "$FARMOUT_HOME/jobs/blocker"
+  jq -n --argjson pid "$$" '{admitted:true,status:"running",sup_pid:$pid}' > "$FARMOUT_HOME/jobs/blocker/meta.json"
+  brief 'FAKE: print ok'
+  ( export FARMOUT_QUEUE_POLL_S=0.1 FARMOUT_TEST_JOB_ID=queued-in-place
+    cd "$REPO" && "$FARMOUT" run fake --in-place --owns a.txt --queue --brief "$T/brief.md"
+  ) > "$T/queued-out" 2> "$T/queued-err" &
+  QUEUED_RUNNER=$!
+  local i=0
+  while ! grep -q 'queued .* for a slot' "$T/queued-err" && [ "$i" -lt 200 ]; do sleep 0.1; i=$((i + 1)); done
+  grep -q 'queued .* for a slot' "$T/queued-err" || fail 'job never queued'
+}
+
+test_in_place_queued_base_is_admission_head() {
+  make_feature_branch; start_queued_in_place
+  printf '%s\n' 'user commit while waiting' > "$REPO/other.txt"
+  git -C "$REPO" add other.txt
+  git -C "$REPO" -c user.name=t -c user.email=t@t commit -qm 'user commit while waiting'
+  local head; head="$(git -C "$REPO" rev-parse HEAD)"
+  rm -rf "$FARMOUT_HOME/jobs/blocker"
+  wait "$QUEUED_RUNNER"; local rc=$?
+  assert_eq "$rc" 0 "$(cat "$T/queued-err")"
+  assert_eq "$(meta queued-in-place base)" "$head"
+}
+
+test_in_place_land_and_discard_refused_without_git_change() {
+  make_feature_branch
+  git -C "$REPO" config user.name Worker; git -C "$REPO" config user.email worker@example.test
+  brief 'FAKE: commit worker-change a.txt'; run_job fake --in-place --owns a.txt
+  assert_eq "$RC" 0 "$ERR"
+  local head state cmd m="$FARMOUT_HOME/jobs/$ID/meta.json"
+  head="$(git -C "$REPO" rev-parse HEAD)"; state="$(git -C "$REPO" status --porcelain)"
+  # Task 3 supplies these records; pin the command safety contract now.
+  jq --arg sha "$head" '.commits = [{sha:$sha}]' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
+  for cmd in land discard; do
+    "$FARMOUT" "$cmd" "$ID" > "$T/action-out" 2> "$T/action-err"; RC=$?
+    assert_eq "$RC" 2 "$cmd"
+    assert_eq "$(git -C "$REPO" rev-parse HEAD)" "$head"
+    assert_eq "$(git -C "$REPO" status --porcelain)" "$state"
+    assert_eq "$(meta "$ID" land)" null
+    if [ "$cmd" = land ]; then assert_contains "$(cat "$T/action-err")" "farmout accept $ID"
+    else assert_contains "$(cat "$T/action-err")" "git revert $head"; fi
+  done
+}
+
+test_in_place_branch_switch_fails() {
+  make_feature_branch; git -C "$REPO" branch other-lane
+  brief 'FAKE: checkout other-lane'; run_job fake --in-place --owns a.txt
+  assert_eq "$RC" 1 "$ERR"; assert_eq "$(meta "$ID" status)" failed
+  assert_eq "$(meta "$ID" branch_end)" other-lane
+  assert_contains "$(meta "$ID" error)" feature/in-place-test
+  assert_contains "$(meta "$ID" error)" other-lane
+}
+
+test_in_place_brief_verbatim() {
+  make_feature_branch
+  printf '%s\n' 'FAKE: echo-brief' "say \"hi\" \$HOME \`uname\` it's" '' 'last line' > "$T/brief.md"
+  run_job fake --in-place --owns a.txt --owns 'space file.txt'
+  assert_eq "$RC" 0 "$ERR"
+  local r="$FARMOUT_HOME/jobs/$ID/brief.md"
+  head -1 "$r" | grep -q '^# Ground rules (added by farmout)' || fail 'ground rules missing'
+  assert_contains "$(cat "$r")" "user's live checkout, on branch feature/in-place-test"
+  assert_contains "$(cat "$r")" 'git add a.txt space\ file.txt'
+  assert_contains "$(cat "$r")" 'Never delete the lock.'
+  assert_eq "$(grep -c '^- ' "$r")" 6
+  local expected; expected="$(cat <<'EOF'
+# Ground rules (added by farmout)
+- Your working directory is the user's live checkout, on branch feature/in-place-test. Other agents may be working in this same checkout at the same time. It is not a copy: every change is real.
+- You own only these paths: a.txt space\ file.txt. Edit nothing else. If the task needs a file outside them, stop and say so in your final message.
+- Commit your own paths by name: `git add a.txt space\ file.txt` then `git commit -m "<msg>" -- a.txt space\ file.txt`. Never `git add -A`, `git add .`, `git add -u` or `git commit -a`.
+- Never `checkout`/`switch` a branch, `stash`, `reset`, `rebase`, `merge`, `pull`, `push`, `commit --amend`, `clean`, or `restore` a path you did not change. Leave other agents' uncommitted changes alone.
+- If git reports that `index.lock` exists, wait a few seconds and retry. Never delete the lock.
+- If this checkout does not match what the brief describes, stop and report that as your first finding.
+EOF
+)"
+  assert_eq "$(head -7 "$r")" "$expected" exact-preamble
+  cmp -s "$T/brief.md" <(tail -c "$(wc -c < "$T/brief.md")" "$r") || fail 'brief not passed verbatim'
+}
+
+test_in_place_owns_must_be_repo_relative() {
+  make_feature_branch; brief 'FAKE: print ok'
+  local p
+  for p in /tmp/outside ../outside ':(top)../outside' ''; do
+    run_job fake --in-place --owns "$p"
+    assert_eq "$RC" 2 "$p: $ERR"
+    [ ! -d "$FARMOUT_HOME/jobs" ] || fail 'claimed a job for invalid owns'
+  done
+}
+
+test_in_place_allows_dirty_path_outside_owns() {
+  make_feature_branch; printf 'user work\n' > "$REPO/user.txt"
+  git -C "$REPO" add user.txt
+  local index; index="$(git -C "$REPO" diff --cached)"
+  brief 'FAKE: print ok'; run_job fake --in-place --owns a.txt
+  assert_eq "$RC" 0 "$ERR"
+  assert_eq "$(git -C "$REPO" diff --cached)" "$index"
+  assert_eq "$(cat "$REPO/user.txt")" 'user work'
+}
+
+test_in_place_repo_must_be_current_checkout() {
+  make_feature_branch
+  local linked="$T/linked"; git -C "$REPO" worktree add -q -b linked-test "$linked"
+  brief 'FAKE: print ok'; run_job fake --in-place --owns a.txt --repo "$linked"
+  assert_eq "$RC" 2 "$ERR"; assert_contains "$ERR" 'current checkout'
+  [ ! -d "$FARMOUT_HOME/jobs" ] || fail 'claimed a job before preflight'
+}
+
+test_in_place_allows_default_branch_with_override() {
+  git -C "$REPO" branch -M main
+  brief 'FAKE: print ok'; run_job fake --in-place --owns a.txt --allow-default-branch
+  assert_eq "$RC" 0 "$ERR"
+}
+
+test_in_place_refuses_dirty_owned_path() {
+  make_feature_branch; printf dirty >> "$REPO/a.txt"
+  brief 'FAKE: print ok'; run_job fake --in-place --owns a.txt
+  assert_eq "$RC" 2 "$ERR"; assert_contains "$ERR" a.txt
+  [ ! -d "$FARMOUT_HOME/jobs" ] || fail 'claimed a job before preflight'
+}
+
+test_in_place_refuses_default_branch() {
+  git -C "$REPO" branch -M main
+  brief 'FAKE: print ok'; run_job fake --in-place --owns a.txt
+  assert_eq "$RC" 2 "$ERR"; assert_contains "$ERR" '--allow-default-branch'
+  [ ! -d "$FARMOUT_HOME/jobs" ] || fail 'claimed a job before preflight'
+}
+
+test_in_place_refuses_detached_head() {
+  git -C "$REPO" checkout -q --detach
+  brief 'FAKE: print ok'; run_job fake --in-place --owns a.txt
+  assert_eq "$RC" 2 "$ERR"
+  assert_contains "$ERR" 'detached HEAD'
+  [ ! -d "$FARMOUT_HOME/jobs" ] || fail 'claimed a job before preflight'
+}
+
+test_in_place_runs_in_checkout() {
+  make_feature_branch
+  git -C "$REPO" config user.name Worker
+  git -C "$REPO" config user.email worker@example.test
+  brief 'FAKE: commit worker-change a.txt'
+  local before after; before="$(git -C "$REPO" rev-parse HEAD)"
+  run_job fake --in-place --owns a.txt
+  assert_eq "$RC" 0 "$ERR"
+  after="$(git -C "$REPO" rev-parse HEAD)"
+  [ "$before" != "$after" ] || fail 'in-place worker did not advance checkout HEAD'
+  assert_eq "$(meta "$ID" mode)" in-place
+  assert_eq "$(meta "$ID" worktree)" null
+  assert_eq "$(meta "$ID" branch)" null
+  assert_eq "$(meta "$ID" checkout)" "$REPO"
+  assert_eq "$(meta "$ID" base)" "$before"
+  assert_eq "$(meta "$ID" head_end)" "$after"
+  assert_eq "$(meta "$ID" branch_end)" feature/in-place-test
+  assert_eq "$(jq -c .owns "$FARMOUT_HOME/jobs/$ID/meta.json")" '["a.txt"]'
+  [ ! -e "$FARMOUT_HOME/worktrees" ] || [ -z "$(find "$FARMOUT_HOME/worktrees" -mindepth 1 -print -quit)" ] || fail 'created a worktree'
+  [ ! -e "$FARMOUT_HOME/jobs/$ID/diff.patch" ] || fail 'captured an in-place patch'
+  assert_eq "$(git -C "$REPO" log -1 --format=%an)" Worker
+}
+
+test_in_place_flag_conflicts() {
+  make_feature_branch; brief 'FAKE: ok'
+  run_job fake --in-place --owns a.txt --ref HEAD
+  assert_eq "$RC" 2 ref
+  run_job fake --in-place --owns a.txt --no-repo
+  assert_eq "$RC" 2 no-repo
+  run_job fake --in-place --owns a.txt --with a.txt
+  assert_eq "$RC" 2 with
+  run_job fake --in-place --owns a.txt --out out.md
+  assert_eq "$RC" 2 out
+  run_job fake --in-place
+  assert_eq "$RC" 2 missing-owns
+}
+
+test_remove_worktree_refuses_in_place_meta() {
+  local linked="$T/linked"; git -C "$REPO" worktree add -q -b linked-test "$linked"
+  local job="$FARMOUT_HOME/jobs/manual"; mkdir -p "$job"
+  jq -n --arg r "$REPO" --arg c "$linked" \
+    '{mode:"in-place",repo:$r,checkout:$c,worktree:$c,branch:"linked-test"}' > "$job/meta.json"
+  FARMOUT_HOME="$FARMOUT_HOME" "$FARMOUT" clean --all >/dev/null
+  [ -d "$linked" ] || fail 'clean removed the live linked worktree'
+  git -C "$REPO" show-ref --verify --quiet refs/heads/linked-test || fail 'clean deleted the live branch'
+}
+
 test_parse_duration() {
   . "$ROOT/lib/common.sh"
   assert_eq "$(parse_duration 90s)" 90
@@ -1455,7 +1685,7 @@ test_patch_capture_failure_keeps_timeout() {
 # ---- runner ----------------------------------------------------------------
 
 pass=0; failed=""
-tests="$(declare -F | awk '{print $3}' | grep '^test_' | grep -- "${1:-}")"
+tests="$(declare -F | awk '{print $3}' | grep '^test_' | grep -E -- "${1:-}")"
 for t in $tests; do
   if ( setup; trap teardown EXIT; "$t" ); then
     pass=$((pass + 1)); echo "ok   $t"
