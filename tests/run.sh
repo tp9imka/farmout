@@ -273,6 +273,57 @@ test_in_place_historical_deleted_binary_and_nul_paths() {
   assert_contains "$output" "$(jq -nc --arg p "$renamed" '$p')"
 }
 
+test_in_place_historical_attribute_pathspec_survives_later_changes() {
+  local scenario
+  for scenario in concurrent solo; do
+    (
+      setup; trap teardown EXIT
+      make_feature_branch; configure_in_place_author; track_in_place_paths
+      printf 'owned.txt lane\n' > "$REPO/.gitattributes"
+      printf 'before\n' > "$REPO/owned.txt"
+      git -C "$REPO" add -- .gitattributes owned.txt
+      git -C "$REPO" commit -qm 'attribute ownership fixture'
+      start_attribution_lane lane ':(attr:lane)*.txt'; local lane_runner="$ATTRIBUTION_RUNNER" peer_runner=""
+      if [ "$scenario" = concurrent ]; then
+        start_attribution_lane peer c.txt; peer_runner="$ATTRIBUTION_RUNNER"
+        release_attribution_lane peer
+      fi
+      release_attribution_lane lane
+      printf 'historical change\n' > "$REPO/owned.txt"
+      git -C "$REPO" add -- owned.txt; git -C "$REPO" commit -qm 'owned change' -- owned.txt
+      local changed_sha; changed_sha="$(git -C "$REPO" rev-parse HEAD)"
+      git -C "$REPO" rm -q -- owned.txt; git -C "$REPO" commit -qm 'owned deletion' -- owned.txt
+      local deleted_sha; deleted_sha="$(git -C "$REPO" rev-parse HEAD)"
+      printf 'owned.txt -lane\n' > "$REPO/.gitattributes"
+      git -C "$REPO" add -- .gitattributes; git -C "$REPO" commit -qm 'later attribute change' -- .gitattributes
+      local attribute_sha index attributes
+      attribute_sha="$(git -C "$REPO" rev-parse HEAD)"
+      index="$(git hash-object "$REPO/.git/index")"; attributes="$(git hash-object "$REPO/.gitattributes")"
+      finish_attribution_lane lane "$lane_runner"
+      [ -z "$peer_runner" ] || finish_attribution_lane peer "$peer_runner"
+      if [ "$scenario" = concurrent ]; then
+        assert_eq "$(jq -c '[.commits[].sha]' "$FARMOUT_HOME/jobs/lane/meta.json")" \
+          "[\"$changed_sha\",\"$deleted_sha\"]" 'historical attribute-owned commits omitted'
+        assert_eq "$(jq -c '[.unattributed[].sha]' "$FARMOUT_HOME/jobs/lane/meta.json")" "[\"$attribute_sha\"]"
+        assert_eq "$(jq -c .outside_owns "$FARMOUT_HOME/jobs/lane/meta.json")" '[]'
+        assert_eq "$(jq -c '[.unattributed[].sha]' "$FARMOUT_HOME/jobs/peer/meta.json")" "[\"$attribute_sha\"]"
+      else
+        assert_eq "$(jq -c '[.commits[].sha]' "$FARMOUT_HOME/jobs/lane/meta.json")" \
+          "[\"$changed_sha\",\"$deleted_sha\",\"$attribute_sha\"]"
+        assert_eq "$(jq -c .outside_owns "$FARMOUT_HOME/jobs/lane/meta.json")" '[".gitattributes"]' \
+          'historically owned file falsely outside owns'
+        assert_eq "$(jq -c .unattributed "$FARMOUT_HOME/jobs/lane/meta.json")" '[]'
+      fi
+      assert_eq "$(jq -c .commits[1].files "$FARMOUT_HOME/jobs/lane/meta.json")" \
+        '[{"path":"owned.txt","added":0,"deleted":1}]'
+      assert_eq "$(git hash-object "$REPO/.git/index")" "$index" 'historical attribute probe touched index'
+      assert_eq "$(git hash-object "$REPO/.gitattributes")" "$attributes" 'historical attribute probe rewrote checkout attributes'
+      assert_eq "$(git -C "$REPO" rev-parse HEAD)" "$attribute_sha"
+      [ ! -e "$REPO/owned.txt" ] || fail 'historical probe restored deleted file'
+    ) || fail "$scenario historical attribute-pathspec scenario failed"
+  done
+}
+
 test_in_place_temporal_overlap_uses_intervals_and_checkout_identity() {
   make_feature_branch; configure_in_place_author; track_in_place_paths
   local alias="$T/checkout-alias" foreign="$T/foreign"

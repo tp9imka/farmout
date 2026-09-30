@@ -249,7 +249,8 @@ in_place_overlapping_jobs() { # jobdir ended-iso
 
 # Evaluate Git's complete pathspec set against the commit and its parents.
 # An absent private index prevents ls-files --with-tree from also matching
-# unrelated paths in the live index. ls-files reads trees; it never writes it.
+# unrelated paths in the live index. Attribute pathspecs must also read their
+# attributes from that historical tree. ls-files never writes the index.
 in_place_owned_at_commit() ( # checkout sha owns-json absent-index-path
   local checkout="$1" sha="$2" owns="$3" empty_index="$4" trees tree
   read_owned_pathspecs "$owns" || return 2
@@ -257,7 +258,7 @@ in_place_owned_at_commit() ( # checkout sha owns-json absent-index-path
   set -o pipefail
   {
     for tree in $trees; do
-      GIT_INDEX_FILE="$empty_index" owned_files "$checkout" "$tree" "${OWNED_PATHS[@]}" || return 1
+      GIT_ATTR_SOURCE="$tree" GIT_INDEX_FILE="$empty_index" owned_files "$checkout" "$tree" "${OWNED_PATHS[@]}" || return 1
     done
   } | jq -Rs 'split("\u0000") | .[:-1] | unique'
 )
