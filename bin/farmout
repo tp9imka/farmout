@@ -225,6 +225,122 @@ in_place_admission_guard() { # jobdir
   in_place_overlap_guard "$(basename "$job")" "$repo" "$owns_json"
 }
 
+# NUL-delimited job directories: overlap is historical, independent of a
+# peer's current status. An unfinished admitted interval has no upper bound.
+in_place_overlapping_jobs() { # jobdir ended-iso
+  local job="$1" ended="$2" checkout started d peer peer_checkout
+  checkout="$(canonical_checkout "$(meta_get "$job" checkout)")" || return 1
+  started="$(jq -r '.admitted_at // .started // empty' "$job/meta.json")" || return 1
+  [ -n "$started" ] || return 1
+  for d in "$FARMOUT_HOME"/jobs/*/; do
+    d="${d%/}"
+    [ "$d" != "$job" ] && [ -f "$d/meta.json" ] || continue
+    peer="$(cat "$d/meta.json")" || return 1
+    printf '%s' "$peer" | jq -e --arg start "$started" --arg end "$ended" '
+      .mode == "in-place" and .admitted == true
+      and ((.admitted_at // .started) as $s | $s != null and $s <= $end)
+      and (.ended == null or .ended >= $start)' >/dev/null 2>&1 || continue
+    peer_checkout="$(printf '%s' "$peer" | jq -r '.checkout // .repo // empty')"
+    peer_checkout="$(canonical_checkout "$peer_checkout")" || continue
+    [ "$peer_checkout" = "$checkout" ] && printf '%s\0' "$d"
+  done
+  return 0
+}
+
+# Evaluate Git's complete pathspec set against the commit and its parents.
+# An absent private index prevents ls-files --with-tree from also matching
+# unrelated paths in the live index. ls-files reads trees; it never writes it.
+in_place_owned_at_commit() ( # checkout sha owns-json absent-index-path
+  local checkout="$1" sha="$2" owns="$3" empty_index="$4" trees tree
+  read_owned_pathspecs "$owns" || return 2
+  trees="$(GIT_OPTIONAL_LOCKS=0 git -C "$checkout" rev-list --parents -n 1 "$sha")" || return 1
+  set -o pipefail
+  {
+    for tree in $trees; do
+      GIT_INDEX_FILE="$empty_index" owned_files "$checkout" "$tree" "${OWNED_PATHS[@]}" || return 1
+    done
+  } | jq -Rs 'split("\u0000") | .[:-1] | unique'
+)
+
+in_place_commit_files() ( # checkout sha -> [{path,added,deleted}]
+  set -o pipefail
+  # Disable configurable rename folding: each old/new path remains a touched
+  # path, with its own accurate deletion/addition counts, even across owners.
+  GIT_OPTIONAL_LOCKS=0 git -C "$1" diff-tree --root --no-commit-id --numstat --no-renames -r -z "$2" \
+    | perl -0ne '
+      /\A([0-9]+|-)\t([0-9]+|-)\t(.*)\0\z/s or die "invalid git numstat record\n";
+      print "$1\0$2\0$3\0";
+    ' | jq -Rs 'split("\u0000") | .[:-1] |
+      [range(0; length; 3) as $i | {path:.[$i+2],
+        added:(.[$i] | if . == "-" then null else tonumber end),
+        deleted:(.[$i+1] | if . == "-" then null else tonumber end)}]'
+)
+
+in_place_uncommitted() ( # checkout owns-json -> sorted unique paths
+  local checkout="$1"
+  read_owned_pathspecs "$2" || return 2
+  set -o pipefail
+  GIT_OPTIONAL_LOCKS=0 git -C "$checkout" status --porcelain=v1 -z --untracked-files=all -- "${OWNED_PATHS[@]}" \
+    | perl -0ne '
+      if ($rename) { print $_; $rename=0; next; }
+      length($_) >= 4 or die "invalid git status record\n";
+      $rename = substr($_,0,2) =~ /[RC]/;
+      print substr($_,3);
+      END { die "incomplete git rename record\n" if $rename; }
+    ' | jq -Rs 'split("\u0000") | .[:-1] | unique'
+)
+
+in_place_finalize() ( # jobdir [ended-iso]
+  local job="$1" ended="${2:-$(now_iso)}" checkout head branch base owns scratch peer
+  local sha subject files mine matched self_match entry owner owned uncommitted
+  local commits='[]' unattributed='[]' outside='[]' owners=()
+  checkout="$(meta_get "$job" checkout)"; base="$(meta_get "$job" base)"
+  head="$(GIT_OPTIONAL_LOCKS=0 git -C "$checkout" rev-parse HEAD)" || return 1
+  branch="$(GIT_OPTIONAL_LOCKS=0 git -C "$checkout" symbolic-ref --quiet --short HEAD 2>/dev/null)"
+  # Save the snapshot even if a later diagnostic cannot be computed.
+  meta_set "$job" --arg head "$head" --arg branch "$branch" --arg ended "$ended" \
+    '.head_end = $head | .branch_end = (if $branch == "" then null else $branch end) | .ended = $ended' || return 1
+  owns="$(meta_get "$job" owns)"
+  read_owned_pathspecs "$owns" || return 2
+  owners+=("$owns")
+  scratch="$(mktemp -d "$job/attribution.XXXXXX")" || return 1
+  trap 'rm -rf -- "$scratch"' EXIT
+  in_place_overlapping_jobs "$job" "$ended" > "$scratch/peers" || return 1
+  while IFS= read -r -d '' peer; do
+    owner="$(meta_get "$peer" owns)"
+    read_owned_pathspecs "$owner" || return 2
+    owners+=("$owner")
+  done < "$scratch/peers"
+  GIT_OPTIONAL_LOCKS=0 git -C "$checkout" rev-list --reverse "$base..$head" > "$scratch/commits" || return 1
+  while IFS= read -r sha; do
+    subject="$(GIT_OPTIONAL_LOCKS=0 git -C "$checkout" show -s --format=%s "$sha")" || return 1
+    files="$(in_place_commit_files "$checkout" "$sha")" || return 1
+    mine="$(in_place_owned_at_commit "$checkout" "$sha" "$owns" "$scratch/absent-index")" || return 1
+    matched=0; self_match=false
+    for owner in "${owners[@]}"; do
+      if [ "$owner" = "$owns" ]; then owned="$mine"
+      else owned="$(in_place_owned_at_commit "$checkout" "$sha" "$owner" "$scratch/absent-index")" || return 1; fi
+      if printf '%s' "$files" | jq -e --argjson owned "$owned" 'any(.[]; .path as $p | $owned | index($p) != null)' >/dev/null; then
+        matched=$((matched + 1))
+        [ "$owner" != "$owns" ] || self_match=true
+      fi
+    done
+    entry="$(jq -nc --arg sha "$sha" --arg subject "$subject" --argjson files "$files" --argjson matched "$matched" \
+      '{sha:$sha,subject:$subject,files:$files,shared:($matched > 1)}')" || return 1
+    if [ "${#owners[@]}" -eq 1 ] || $self_match; then
+      commits="$(printf '%s' "$commits" | jq -c --argjson entry "$entry" '. + [$entry]')" || return 1
+      outside="$(printf '%s' "$outside" | jq -c --argjson files "$files" --argjson mine "$mine" \
+        '. + [$files[].path | . as $p | select($mine | index($p) == null)] | unique')" || return 1
+    elif [ "$matched" -eq 0 ]; then
+      unattributed="$(printf '%s' "$unattributed" | jq -c --argjson entry "$entry" '. + [$entry]')" || return 1
+    fi
+  done < "$scratch/commits"
+  uncommitted="$(in_place_uncommitted "$checkout" "$owns")" || return 1
+  meta_set "$job" --argjson commits "$commits" --argjson unattributed "$unattributed" \
+    --argjson uncommitted "$uncommitted" --argjson outside "$outside" \
+    '.commits = $commits | .unattributed = $unattributed | .uncommitted = $uncommitted | .outside_owns = $outside'
+)
+
 make_scratch_repo() {
   local d
   mkdir -p "$FARMOUT_HOME/scratch" && d="$(mktemp -d "$FARMOUT_HOME/scratch/repo.XXXXXX")" || return 1
@@ -766,6 +882,7 @@ cmd_run() {
   else status=empty
   fi
 
+  local ended; ended="$(now_iso)"
   if [ "$mode" = write ]; then
     # Stage everything first so the patch covers uncommitted changes and any
     # commit the worker made itself, then diff the index against the
@@ -787,9 +904,11 @@ cmd_run() {
         commit -q --no-verify -m "farmout $id"; }
     ) >/dev/null 2>&1
   elif [ "$mode" = in-place ]; then
-    local branch_end; branch_end="$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null)"
-    meta_set "$job" --arg head "$(git -C "$repo" rev-parse HEAD)" --arg branch "$branch_end" \
-      '.head_end = $head | .branch_end = (if $branch == "" then null else $branch end)'
+    if ! in_place_finalize "$job" "$ended"; then
+      case "$status" in ok|empty) status=failed ;; esac
+      worker_error="in-place finalization failed; could not record attribution"
+    fi
+    local branch_end; branch_end="$(meta_get "$job" branch_end)"
     if [ "$branch_end" != "$source_branch" ]; then
       status=failed
       worker_error="worker switched branch from '$source_branch' to '${branch_end:-detached HEAD}'"
@@ -805,7 +924,8 @@ cmd_run() {
     remove_worktree "$job"
   fi
 
-  meta_set "$job" --arg s "$status" --argjson c "$code" --argjson v "$survivors" --arg e "$(now_iso)" --arg err "$worker_error" \
+  [ "$mode" = in-place ] || ended="$(now_iso)"
+  meta_set "$job" --arg s "$status" --argjson c "$code" --argjson v "$survivors" --arg e "$ended" --arg err "$worker_error" \
     '.status = $s | .exit_code = $c | .survivors = $v | .ended = $e
      | if .error == null and $err != "" then .error = $err else . end'
   outcome_append "$(jq -c '{id, cli, kind, mode, model, status, started, ended}' "$job/meta.json")"
@@ -871,6 +991,30 @@ cmd_result() {
     [ -n "$partial" ] && printf '%s\n%s\n' "--- partial result (no final message; recovered from the log)" "$partial"
   fi
   meta_set "$JOB" '.result_read = true'
+  if [ "$(meta_get "$JOB" mode)" = in-place ]; then
+    echo '--- commits attributed heuristically'
+    jq -r '.commits[]? |
+      def count($key): if any(.files[]; .[$key] == null) then "?" else ([.files[] | .[$key]] | add // 0 | tostring) end;
+      "\(.sha[0:7]) \(.subject) (+\(count("added")) -\(count("deleted")), \(.files | length) files)"' "$JOB/meta.json"
+    echo 'Attribution is heuristic: exact when concurrent lanes keep to their --owns paths; hashes may change after rebase.'
+    local field heading
+    for field in uncommitted outside_owns unattributed; do
+      jq -e --arg f "$field" '(.[$f] // []) | length > 0' "$JOB/meta.json" >/dev/null || continue
+      case "$field" in
+        uncommitted) heading='uncommitted owned paths' ;;
+        outside_owns) heading='paths outside --owns' ;;
+        unattributed) heading='unattributed commits' ;;
+      esac
+      printf '%s\n' "--- warning: $heading"
+      if [ "$field" = unattributed ]; then
+        jq -r '.unattributed[] | "\(.sha[0:7]) \(.subject)"' "$JOB/meta.json"
+      else
+        # JSON quoting makes embedded newlines/tabs legible as one path.
+        jq -r --arg f "$field" '.[$f][] | @json' "$JOB/meta.json"
+      fi
+    done
+    return 0
+  fi
   if [ -d "$JOB/out" ]; then
     echo "--- out files ($JOB/out)"
     jq -r '.out[]? // empty' "$JOB/meta.json"

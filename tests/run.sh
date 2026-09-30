@@ -46,7 +46,13 @@ wait_for_meta_pid() { # id
     [ "$(meta "$1" pid 2>/dev/null)" != null ] && [ -n "$(meta "$1" pid 2>/dev/null)" ] && return 0
     sleep 0.2; i=$((i + 1))
   done
-  fail "job $1 never recorded a pid"
+  local diagnostic="" log
+  for log in "$T/holder-$1-err" "$T/$1-err"; do
+    [ ! -f "$log" ] || diagnostic="$diagnostic $(cat "$log")"
+  done
+  [ ! -f "$FARMOUT_HOME/jobs/$1/meta.json" ] \
+    || diagnostic="$diagnostic $(jq -c '{admitted,status,error}' "$FARMOUT_HOME/jobs/$1/meta.json")"
+  fail "job $1 never recorded a pid${diagnostic:+:$diagnostic}"
 }
 
 # ---- lib -------------------------------------------------------------------
@@ -75,6 +81,243 @@ track_in_place_paths() {
   printf '%s\n' c > "$REPO/c.txt"
   git -C "$REPO" add dir/b.txt c.txt
   git -C "$REPO" -c user.name=t -c user.email=t@t commit -qm 'lane fixtures'
+}
+
+configure_in_place_author() {
+  git -C "$REPO" config user.name repo-user
+  git -C "$REPO" config user.email repo@example.test
+}
+
+wait_for_attribution_marker() { # path
+  local i=0
+  while [ "$i" -lt 100 ]; do
+    [ -f "$1" ] && return 0
+    sleep 0.1; i=$((i + 1))
+  done
+  fail "worker did not reach $1"
+}
+
+start_attribution_lane() { # id owns [commit-path [additional-owns...]]; sets ATTRIBUTION_RUNNER
+  local id="$1" owns="$2" commit_path="${3:-}"
+  local additional=() pathspec
+  if [ "$#" -gt 3 ]; then
+    shift 3
+    for pathspec in "$@"; do additional+=(--owns "$pathspec"); done
+  fi
+  mkfifo "$T/$id-start" "$T/$id-end"
+  printf 'FAKE: cat %s\n' "$T/$id-start" > "$T/$id-brief.md"
+  [ -z "$commit_path" ] || printf 'FAKE: commit %s-change %s\n' "$id" "$commit_path" >> "$T/$id-brief.md"
+  printf 'FAKE: write %s ready\nFAKE: cat %s\nFAKE: print %s-done\n' \
+    "$T/$id-ready" "$T/$id-end" "$id" >> "$T/$id-brief.md"
+  ( export FARMOUT_TEST_JOB_ID="$id"
+    cd "$REPO" && "$FARMOUT" run fake --in-place --owns "$owns" "${additional[@]}" --timeout 60s --brief "$T/$id-brief.md"
+  ) > "$T/$id-out" 2> "$T/$id-err" &
+  ATTRIBUTION_RUNNER=$!
+  wait_for_meta_pid "$id"
+}
+
+release_attribution_lane() { # id
+  printf '\n' > "$T/$1-start"
+  wait_for_attribution_marker "$T/$1-ready"
+}
+
+finish_attribution_lane() { # id runner
+  printf '\n' > "$T/$1-end"
+  wait "$2" || fail "lane $1 failed: $(cat "$T/$1-err")"
+}
+
+test_in_place_commit_attributed() {
+  make_feature_branch; configure_in_place_author
+  brief 'FAKE: commit worker-change a.txt'; run_job fake --in-place --owns a.txt
+  assert_eq "$RC" 0 "$ERR"
+  local sha; sha="$(git -C "$REPO" rev-parse HEAD)"
+  assert_eq "$(jq -c '.commits' "$FARMOUT_HOME/jobs/$ID/meta.json")" \
+    "[{\"sha\":\"$sha\",\"subject\":\"worker-change\",\"files\":[{\"path\":\"a.txt\",\"added\":1,\"deleted\":3}],\"shared\":false}]"
+  assert_eq "$(git -C "$REPO" show -s --format='%an <%ae>' "$sha")" 'repo-user <repo@example.test>'
+  assert_eq "$(meta "$ID" head_end)" "$sha"
+  assert_eq "$(meta "$ID" branch_end)" feature/in-place-test
+  assert_eq "$(jq -c '[.unattributed,.uncommitted,.outside_owns]' "$FARMOUT_HOME/jobs/$ID/meta.json")" '[[],[],[]]'
+}
+
+test_in_place_result_lists_commits_and_heuristic() {
+  make_feature_branch; configure_in_place_author
+  brief 'FAKE: commit worker-change a.txt' 'FAKE: print final-worker-message'
+  run_job fake --in-place --owns a.txt; assert_eq "$RC" 0 "$ERR"
+  local output sha; sha="$(git -C "$REPO" rev-parse --short=7 HEAD)"
+  output="$("$FARMOUT" result "$ID")"
+  assert_contains "$output" 'final-worker-message'
+  assert_contains "$output" '--- commits attributed heuristically'
+  assert_contains "$output" "$sha worker-change (+1 -3, 1 files)"
+  assert_contains "$output" 'Attribution is heuristic: exact when concurrent lanes keep to their --owns paths; hashes may change after rebase.'
+  case "$output" in *'--- warning:'*) fail 'printed empty warning section' ;; esac
+  assert_eq "$(meta "$ID" result_read)" true
+}
+
+test_in_place_uncommitted_reported() {
+  make_feature_branch
+  brief 'FAKE: write a.txt uncommitted' 'FAKE: print done'; run_job fake --in-place --owns a.txt
+  assert_eq "$RC" 0 "$ERR"; assert_eq "$(meta "$ID" status)" ok
+  assert_eq "$(jq -c .uncommitted "$FARMOUT_HOME/jobs/$ID/meta.json")" '["a.txt"]'
+  assert_contains "$("$FARMOUT" result "$ID")" '--- warning: uncommitted owned paths'
+  git -C "$REPO" -c user.name=t -c user.email=t@t commit -qam 'prepare rename'
+  start_in_place_holder dirty .; local runner="$HOLDER_RUNNER" unusual=$'new space\nfile.txt' index
+  git -C "$REPO" mv a.txt 'renamed space.txt'
+  printf dirty > "$REPO/$unusual"
+  git -C "$REPO" config status.showUntrackedFiles no
+  index="$(git hash-object "$REPO/.git/index")"
+  stop_in_place_holder dirty "$runner"
+  assert_eq "$(jq -c .uncommitted "$FARMOUT_HOME/jobs/dirty/meta.json")" \
+    "$(jq -nc --arg p "$unusual" '["a.txt",$p,"renamed space.txt"]')"
+  assert_eq "$(git hash-object "$REPO/.git/index")" "$index" 'finalization rewrote index'
+}
+
+test_in_place_outside_owns_reported() {
+  make_feature_branch; configure_in_place_author; track_in_place_paths
+  # An old completed lane must not turn a subsequent solo lane concurrent.
+  mkdir -p "$FARMOUT_HOME/jobs/old"
+  jq -n --arg r "$REPO" '{mode:"in-place",checkout:$r,owns:["c.txt"],admitted:true,
+    started:"2000-01-01T00:00:00Z",ended:"2000-01-01T00:00:01Z",status:"ok"}' > "$FARMOUT_HOME/jobs/old/meta.json"
+  brief 'FAKE: commit went-outside c.txt' 'FAKE: commit outside-again c.txt'
+  run_job fake --in-place --owns a.txt; assert_eq "$RC" 0 "$ERR"
+  assert_eq "$(jq -c .outside_owns "$FARMOUT_HOME/jobs/$ID/meta.json")" '["c.txt"]'
+  assert_eq "$(jq '.commits | length' "$FARMOUT_HOME/jobs/$ID/meta.json")" 2
+  assert_eq "$(jq -c '[.commits[].subject]' "$FARMOUT_HOME/jobs/$ID/meta.json")" '["went-outside","outside-again"]'
+  assert_contains "$("$FARMOUT" result "$ID")" '--- warning: paths outside --owns'
+}
+
+test_in_place_attribution_two_lanes() {
+  make_feature_branch; configure_in_place_author; track_in_place_paths
+  start_attribution_lane first a.txt a.txt; local first="$ATTRIBUTION_RUNNER"
+  start_attribution_lane second dir/b.txt dir/b.txt; local second="$ATTRIBUTION_RUNNER"
+  release_attribution_lane first; local first_sha; first_sha="$(git -C "$REPO" rev-parse HEAD)"
+  release_attribution_lane second; local second_sha; second_sha="$(git -C "$REPO" rev-parse HEAD)"
+  finish_attribution_lane first "$first"
+  finish_attribution_lane second "$second"
+  assert_eq "$(jq -c '[.commits[].sha]' "$FARMOUT_HOME/jobs/first/meta.json")" "[\"$first_sha\"]"
+  assert_eq "$(jq -c '[.commits[].sha]' "$FARMOUT_HOME/jobs/second/meta.json")" "[\"$second_sha\"]"
+  assert_eq "$(jq -c '[.commits[].shared]' "$FARMOUT_HOME/jobs/second/meta.json")" '[false]'
+}
+
+test_in_place_shared_commit_attributed_to_each_lane() {
+  make_feature_branch; configure_in_place_author; track_in_place_paths
+  start_attribution_lane first a.txt; local first="$ATTRIBUTION_RUNNER"
+  start_attribution_lane second dir/b.txt; local second="$ATTRIBUTION_RUNNER"
+  release_attribution_lane first; release_attribution_lane second
+  printf shared > "$REPO/a.txt"; printf shared > "$REPO/dir/b.txt"
+  git -C "$REPO" add -- a.txt dir/b.txt
+  git -C "$REPO" commit -qm shared -- a.txt dir/b.txt
+  local sha; sha="$(git -C "$REPO" rev-parse HEAD)"
+  finish_attribution_lane first "$first"; finish_attribution_lane second "$second"
+  local lane expected
+  for lane in first second; do
+    assert_eq "$(jq -c '[.commits[] | {sha,shared}]' "$FARMOUT_HOME/jobs/$lane/meta.json")" "[{\"sha\":\"$sha\",\"shared\":true}]"
+  done
+  assert_eq "$(jq -c .outside_owns "$FARMOUT_HOME/jobs/first/meta.json")" '["dir/b.txt"]'
+  assert_eq "$(jq -c .outside_owns "$FARMOUT_HOME/jobs/second/meta.json")" '["a.txt"]'
+}
+
+test_in_place_hand_commit_unattributed_during_overlap() {
+  make_feature_branch; configure_in_place_author; track_in_place_paths
+  start_attribution_lane first a.txt; local first="$ATTRIBUTION_RUNNER"
+  start_attribution_lane second dir/b.txt; local second="$ATTRIBUTION_RUNNER"
+  release_attribution_lane first; release_attribution_lane second
+  printf manual > "$REPO/c.txt"; git -C "$REPO" add -- c.txt
+  git -C "$REPO" commit -qm manual -- c.txt
+  local sha; sha="$(git -C "$REPO" rev-parse HEAD)"
+  finish_attribution_lane first "$first"; finish_attribution_lane second "$second"
+  local lane
+  for lane in first second; do
+    assert_eq "$(jq -c '[.unattributed[] | {sha,subject,shared}]' "$FARMOUT_HOME/jobs/$lane/meta.json")" \
+      "[{\"sha\":\"$sha\",\"subject\":\"manual\",\"shared\":false}]"
+    assert_eq "$(jq -c .commits "$FARMOUT_HOME/jobs/$lane/meta.json")" '[]'
+    assert_contains "$("$FARMOUT" result "$lane")" '--- warning: unattributed commits'
+  done
+}
+
+test_in_place_historical_deleted_binary_and_nul_paths() {
+  make_feature_branch; configure_in_place_author; track_in_place_paths
+  local deleted=$'odd/-space\tand\nnewline.txt' renamed=$'-renamed outside\nfile.txt'
+  mkdir -p "$REPO/odd"
+  printf 'old\n' > "$REPO/$deleted"
+  printf 'rename\n' > "$REPO/odd/source space.txt"
+  printf 'excluded\n' > "$REPO/odd/excluded.txt"
+  printf '\0old\0' > "$REPO/odd/binary.bin"
+  git -C "$REPO" add -- odd; git -C "$REPO" commit -qm 'odd path fixtures'
+  start_attribution_lane odd ':(glob)odd/*' '' ':(exclude)odd/excluded.txt'; local odd_runner="$ATTRIBUTION_RUNNER"
+  start_attribution_lane peer c.txt; local peer_runner="$ATTRIBUTION_RUNNER"
+  release_attribution_lane odd; release_attribution_lane peer
+  git -C "$REPO" rm -q -- "$deleted"
+  git -C "$REPO" commit -qm 'historical delete' -- "$deleted"
+  local deleted_sha; deleted_sha="$(git -C "$REPO" rev-parse HEAD)"
+  git -C "$REPO" mv -- 'odd/source space.txt' "$renamed"
+  git -C "$REPO" commit -qm 'rename outside' -- 'odd/source space.txt' "$renamed"
+  local renamed_sha; renamed_sha="$(git -C "$REPO" rev-parse HEAD)"
+  printf '\0new\0' > "$REPO/odd/binary.bin"; printf 'breach\n' > "$REPO/odd/excluded.txt"
+  git -C "$REPO" add -- odd/binary.bin odd/excluded.txt
+  git -C "$REPO" commit -qm 'binary and excluded breach' -- odd/binary.bin odd/excluded.txt
+  local binary_sha index; binary_sha="$(git -C "$REPO" rev-parse HEAD)"; index="$(git hash-object "$REPO/.git/index")"
+  finish_attribution_lane odd "$odd_runner"; finish_attribution_lane peer "$peer_runner"
+  assert_eq "$(jq -c '[.commits[].sha]' "$FARMOUT_HOME/jobs/odd/meta.json")" \
+    "[\"$deleted_sha\",\"$renamed_sha\",\"$binary_sha\"]"
+  assert_eq "$(jq -c '.commits[0].files' "$FARMOUT_HOME/jobs/odd/meta.json")" \
+    "$(jq -nc --arg p "$deleted" '[{path:$p,added:0,deleted:1}]')"
+  assert_eq "$(jq -c '[.commits[2].files[] | select(.path == "odd/binary.bin")]' "$FARMOUT_HOME/jobs/odd/meta.json")" \
+    '[{"path":"odd/binary.bin","added":null,"deleted":null}]'
+  assert_eq "$(jq -c .outside_owns "$FARMOUT_HOME/jobs/odd/meta.json")" \
+    "$(jq -nc --arg p "$renamed" '[$p,"odd/excluded.txt"]')"
+  assert_eq "$(jq -c '[.commits,.unattributed]' "$FARMOUT_HOME/jobs/peer/meta.json")" '[[],[]]'
+  assert_eq "$(git hash-object "$REPO/.git/index")" "$index" 'finalization touched index'
+  assert_eq "$(git -C "$REPO" rev-parse HEAD)" "$binary_sha" 'finalization moved HEAD'
+  local output; output="$("$FARMOUT" result odd)"
+  assert_contains "$output" 'binary and excluded breach (+? -?, 2 files)'
+  assert_contains "$output" "$(jq -nc --arg p "$renamed" '$p')"
+}
+
+test_in_place_temporal_overlap_uses_intervals_and_checkout_identity() {
+  make_feature_branch; configure_in_place_author; track_in_place_paths
+  local alias="$T/checkout-alias" foreign="$T/foreign"
+  ln -s "$REPO" "$alias"
+  git -C "$REPO" worktree add -qb other-checkout "$foreign"
+  start_attribution_lane lane a.txt; local runner="$ATTRIBUTION_RUNNER"
+  release_attribution_lane lane
+  local id checkout start end admitted owns
+  # Completed alias peer really overlapped. Other records are a future run,
+  # a finished pre-run peer, an unadmitted waiter, and a linked worktree.
+  for id in completed future past waiting foreign; do
+    checkout="$REPO"; start='2000-01-01T00:00:00Z'; end='2999-01-01T00:00:00Z'; admitted=true; owns=dir/b.txt
+    case "$id" in
+      completed) checkout="$alias"; owns=c.txt ;;
+      future) start='2999-01-01T00:00:00Z'; end='' ;;
+      past) end='2000-01-01T00:00:01Z' ;;
+      waiting) admitted=false ;;
+      foreign) checkout="$foreign" ;;
+    esac
+    mkdir -p "$FARMOUT_HOME/jobs/$id"
+    jq -n --arg r "$checkout" --arg start "$start" --arg end "$end" --arg owns "$owns" --argjson admitted "$admitted" \
+      '{mode:"in-place",checkout:$r,owns:[$owns],admitted:$admitted,
+        admitted_at:$start,started:"1900-01-01T00:00:00Z",
+        ended:(if $end == "" then null else $end end),status:"ok"}' > "$FARMOUT_HOME/jobs/$id/meta.json"
+  done
+  printf peer > "$REPO/c.txt"; git -C "$REPO" add -- c.txt; git -C "$REPO" commit -qm 'completed peer path' -- c.txt
+  printf unowned > "$REPO/dir/b.txt"; git -C "$REPO" add -- dir/b.txt; git -C "$REPO" commit -qm unowned -- dir/b.txt
+  local sha; sha="$(git -C "$REPO" rev-parse HEAD)"
+  finish_attribution_lane lane "$runner"
+  assert_eq "$(jq -c .commits "$FARMOUT_HOME/jobs/lane/meta.json")" '[]'
+  assert_eq "$(jq -c '[.unattributed[].sha]' "$FARMOUT_HOME/jobs/lane/meta.json")" "[\"$sha\"]"
+}
+
+test_in_place_branch_failure_keeps_final_commit_snapshot() {
+  make_feature_branch; configure_in_place_author
+  git -C "$REPO" branch switched-lane
+  brief 'FAKE: checkout switched-lane' 'FAKE: commit switched-change a.txt' 'FAKE: print done'
+  run_job fake --in-place --owns a.txt
+  assert_eq "$RC" 1 "$ERR"
+  assert_eq "$(meta "$ID" status)" failed
+  assert_eq "$(meta "$ID" branch_end)" switched-lane
+  local sha; sha="$(git -C "$REPO" rev-parse HEAD)"
+  assert_eq "$(meta "$ID" head_end)" "$sha"
+  assert_eq "$(jq -c '[.commits[].sha]' "$FARMOUT_HOME/jobs/$ID/meta.json")" "[\"$sha\"]"
+  assert_contains "$(meta "$ID" error)" "worker switched branch from 'feature/in-place-test' to 'switched-lane'"
 }
 
 test_config_in_place_max_default_and_validation() {
