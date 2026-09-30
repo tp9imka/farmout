@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Supervised in-place fix rounds: opt-in `run --in-place --owns <pathspec>`
+  edits and commits directly on the current branch, with clean-owned-path,
+  default-branch and tracked-file overlap guards, plus `limits.in_place_max`
+  (default 3, bounds 1..32) per checkout. Results and the arcade show heuristic
+  commit attribution and ownership warnings; `farmout accept` / ACCEPT records
+  review without changing Git. Worktrees remain the default. In-place rejection
+  requires manual Git revert; there is no automatic revert in v1.
+
 - The arcade no longer drops to NO SIGNAL under heavy load. `/api/state`
   is built on a background thread and a poll waits at most 1 s for a fresh
   build, then gets the last good one, so its latency no longer grows with

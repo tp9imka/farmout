@@ -4,12 +4,12 @@
 
 **You pay for Codex. And Kiro. And Copilot. And Cursor. You still only use one of them at a time.**
 
-`farmout` lets one agent run the others. [Claude Code](https://claude.com/claude-code) stays the orchestrator and farms work out to your other coding-agent CLIs. Each job runs headless in its own git worktree while Claude keeps working. When a job finishes, Claude reviews the result, and a patch reaches your checkout only when you land it.
+`farmout` lets one agent run the others. [Claude Code](https://claude.com/claude-code) stays the orchestrator and farms work out to your other coding-agent CLIs. By default each job runs headless in its own git worktree while Claude keeps working. When a job finishes, Claude reviews the result, and a patch reaches your checkout only when you land it. Explicit in-place jobs instead edit and commit directly on your current branch.
 
 - **Cross-review for real.** Have Codex review what Claude wrote, and Copilot give a second opinion on Codex's review. The workers are different models trained by different companies, so their blind spots differ too.
-- **Isolated by default.** Every job gets its own worktree, cut from a snapshot of your repo. Nothing touches your checkout until you `land` it, and then only as uncommitted changes.
+- **Isolated by default.** Unless you opt into `--in-place`, each job gets its own worktree, cut from a snapshot of your repo. Nothing touches your checkout until you `land` it, and then only as uncommitted changes.
 - **Watched, not hoped for.** Jobs run in the background. farmout detects a stalled job by the absence of real agent events, so a login spinner that keeps writing to the log still counts as a stall. It also recovers partial output from a killed job.
-- **An arcade for your agents.** `farmout arcade` opens a local dashboard. Every Claude session and every farmed-out job appears as a player, with KILL / LAND / DISCARD buttons and a Hall of Fame.
+- **An arcade for your agents.** `farmout arcade` opens a local dashboard. Every Claude session and every farmed-out job appears as a player, with KILL / LAND / DISCARD or in-place ACCEPT buttons and a Hall of Fame.
 - **Plain bash, jq and Python's standard library.** No daemon, no pip packages, no npm install.
 
 ```
@@ -65,6 +65,8 @@ Or drive it yourself:
 |---|---|
 | `farmout run <cli\|auto> --brief task.md` | Start a job. `auto --kind review\|bulk-read\|research\|implement\|second-opinion` picks the CLI by your routing rules, falling back if one is logged out. |
 | `farmout run ... --write` | Let the worker change files. The result comes back as a patch. |
+| `farmout run ... --in-place --owns <pathspec>` | Let the worker edit and commit owned paths in your live checkout. Repeat `--owns` for more paths. |
+| `farmout accept <id>` | Mark an ended in-place lane reviewed; only job metadata changes. |
 | `farmout status` / `result <id>` / `progress <id>` | Watch jobs, read the final message and diffstat, and see real progress events. |
 | `farmout land <id>` / `discard <id>` | Apply the patch as uncommitted changes, or throw it away. |
 | `farmout kill <id>` / `clean --mine` | Stop a job, or tidy up finished ones. |
@@ -80,7 +82,37 @@ Useful flags on `run`:
 - `--queue`: wait for a free slot instead of failing at the job cap.
 - `--timeout`, `--model`, `--effort`: per-job overrides.
 
-**[Usage scenarios →](docs/scenarios.md)** cross-review, second opinions, bulk reading, web research, parallel implementation, audits that return a report, fan-out with a queue.
+### Fix rounds in the live checkout
+
+Opt in only when the lanes all belong on this branch and you want worker commits:
+
+```bash
+farmout run codex --in-place --owns src/export --owns tests/export --brief fix-export.md
+farmout result <id>    # commit list and ownership warnings
+# Review each full commit diff and lane-local tests, then:
+farmout accept <id>
+```
+
+This sacrifices worktree isolation: worker edits and commits are immediately real.
+`--owns` is mandatory and lanes must be disjoint. Launch refuses detached HEAD,
+the default branch (unless explicitly overridden with `--allow-default-branch`),
+dirty owned paths and tracked-file overlap with a live lane in the same checkout.
+Uncommitted edits outside the owned paths are allowed. Future untracked-file
+overlap cannot be detected; reserve those names yourself. `--ref`, `--no-repo`,
+`--with`, `--out` and `--repo` pointing outside the current checkout are refused.
+Queued admission rechecks the branch, owned-path cleanliness and overlap; both
+the global job cap and per-checkout in-place cap apply.
+
+Commit attribution is heuristic, based on touched paths. Review the full diffs,
+results and warnings before accepting; hashes are a snapshot and may change
+after rebase. ACCEPT records review without changing Git. `land` and `discard`
+refuse in-place jobs; rejection requires manual review and `git revert <sha...>`.
+There is no automatic `farmout revert` in v1. Killing a job leaves its partial
+changes in the checkout. Cleanup removes only the job record, keeping successful
+unaccepted lanes unless forced with `--all`. Run focused tests per lane and one
+full gate after all lanes are accepted.
+
+**[Usage scenarios →](docs/scenarios.md)** cross-review, second opinions, bulk reading, web research, parallel implementation, audits that return a report, fan-out with a queue, in-place PR fix rounds.
 
 ## The arcade
 
@@ -99,6 +131,9 @@ Useful flags on `run`:
 Try it without running anything: `farmout arcade --demo`.
 
 ## How it works
+
+The default worktree mode follows these steps; in-place mode skips snapshot,
+worktree and patch landing, and ends with commit review and ACCEPT instead.
 
 1. **Snapshot.** `run` records your repo's state: HEAD plus your uncommitted edits, or exactly `--ref`. It stores this as a commit authored by `farmout@localhost`, so it never shows up as your work.
 2. **Worktree.** The job gets a fresh git worktree of that snapshot. The worker CLI runs there headless, fully auto-approved, in its own process group, under a timeout.
@@ -123,11 +158,15 @@ Optional. `~/.config/farmout/config.json`, also editable from the arcade's SETUP
     { "kind": "review",   "prefer": "codex", "fallback": "copilot" },
     { "kind": "research", "prefer": "codex", "fallback": "kiro" }
   ],
-  "limits": { "stall_min": 10, "max_jobs": 4 }
+  "limits": { "stall_min": 10, "max_jobs": 4, "in_place_max": 3 }
 }
 ```
 
 Built-in routing when there's no `routing` key: review => codex, bulk-read => kiro, research => kiro, implement => cursor, second-opinion => copilot, each with a fallback. `workers.kiro.engine` picks Kiro's agent engine (`v1`, `v2` or `v3`; default `v2`). On `v3` the arcade shows no credit count, since v3 doesn't report metering in its event stream. Jobs live in `~/.cache/farmout` (override with `FARMOUT_HOME`).
+
+`limits.in_place_max` defaults to 3 and accepts integers from 1 through 32.
+It caps running in-place jobs per checkout in addition to the global `max_jobs`
+cap, and is editable in SETUP. Use `--queue` to wait when either cap is reached.
 
 ## Uninstall
 
