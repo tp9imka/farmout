@@ -63,6 +63,7 @@ export function FocusJob({ fw, onBack, onAsk, actionMsg, busy }) {
             <div style="font-family:var(--font-body); font-size:14px;">${fw.landedMsg}</div>
           </div>`}
         <div style="display:flex; align-items:center; gap:10px; min-height:36px;">
+          ${fw.canAccept && !busy && html`<div class="h-land" onClick=${() => onAsk('accept')} style="font-size:10px; padding:11px 14px; background:var(--color-accent); border:2px solid var(--color-accent); cursor:pointer;">ACCEPT</div>`}
           ${fw.canLand && !busy && html`<div class="h-land" onClick=${() => onAsk('land')} style="font-size:10px; padding:11px 14px; background:var(--color-accent); border:2px solid var(--color-accent); cursor:pointer;">LAND</div>`}
           ${fw.canDiscard && !busy && html`<div class="h-g8" onClick=${() => onAsk('discard')} style="font-size:10px; padding:11px 14px; border:2px solid var(--color-bg); cursor:pointer;">DISCARD</div>`}
           ${fw.canKill && !busy && html`<div class="h-g8" onClick=${() => onAsk('kill')} style="font-size:10px; padding:11px 14px; border:2px solid var(--color-accent); color:var(--color-accent); cursor:pointer;">KILL</div>`}
@@ -81,12 +82,30 @@ export function FocusJob({ fw, onBack, onAsk, actionMsg, busy }) {
           ${fw.meta.map(m => html`
             <div style="display:flex; flex-direction:column; gap:8px; padding:12px 16px; min-width:0; border-right:2px solid #2d2b2b; border-bottom:2px solid #2d2b2b; grid-column:${m.span};">
               <div style="font-size:7px; color:var(--color-neutral-500);">${m.k}</div>
-              <div style="font-family:var(--font-body); font-size:15px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${m.v}</div>
+              ${m.lines && m.lines.length > 0
+                ? m.lines.map(line => html`<div style="font-family:monospace; font-size:14px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; user-select:all;">${line}</div>`)
+                : html`<div style="font-family:var(--font-body); font-size:15px; font-weight:700; white-space:${m.wrap ? 'pre-wrap' : 'nowrap'}; overflow-wrap:anywhere; overflow:hidden; text-overflow:ellipsis;">${m.v}</div>`}
             </div>`)}
         </div>
         <div style="flex:1; min-height:0; display:grid; grid-template-columns:minmax(0,1.5fr) minmax(0,1fr); gap:10px;">
           <${Replay} title="REPLAY" lines=${fw.replay} />
-          <div style="display:flex; flex-direction:column; gap:8px; padding:16px 18px; background:#1a1817; border:2px solid #444141; overflow:hidden;">
+          <div style="display:flex; flex-direction:column; gap:8px; min-width:0; padding:16px 18px; background:#1a1817; border:2px solid #444141; overflow:auto;">
+            ${fw.showCommits && html`
+              <div style="font-size:8px; color:var(--color-neutral-500); line-height:1.6;">COMMITS · ${fw.commits.length}</div>
+              ${fw.commits.map(c => html`
+                <div style="display:flex; flex-direction:column; gap:6px; padding:8px 0; border-bottom:2px solid #2d2b2b;">
+                  <div style="font-family:var(--font-body); font-size:14px; line-height:1.5; overflow-wrap:anywhere;"><span style="font-family:monospace; color:var(--color-neutral-400);">${c.sha}</span> ${c.subject}</div>
+                  <div style="font-family:var(--font-body); font-size:12px; color:var(--color-neutral-400);">${c.summary}</div>
+                  ${c.sharedLabel && html`<div style="font-size:7px; color:#f0a830;">${c.sharedLabel}</div>`}
+                  ${c.availabilityLabel && html`<div style="font-size:7px; line-height:1.8; color:#f0a830;">${c.availabilityLabel}</div>`}
+                </div>`)}
+              ${fw.commits.length === 0 && html`<div style="font-family:var(--font-body); font-size:13px; color:var(--color-neutral-500);">No attributed commits recorded.</div>`}
+              ${fw.heuristicLabel && html`<div style="font-family:var(--font-body); font-size:13px; line-height:1.5; color:#f0a830;">${fw.heuristicLabel}</div>`}`}
+            ${fw.warnings.map(w => html`
+              <div style="display:flex; flex-direction:column; gap:6px; padding:10px; border:2px solid #f0a830;">
+                <div style="font-size:7px; line-height:1.8; color:#f0a830;">${w.title}</div>
+                ${w.items.map(item => html`<div style="font-family:monospace; font-size:12px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; user-select:all;">${item}</div>`)}
+              </div>`)}
             <div style="font-size:8px; color:var(--color-neutral-500); margin-bottom:4px;">${fw.items}</div>
             ${fw.files.map(fl => html`<${FileRow} fl=${fl} />`)}
             ${fw.readOnly && html`

@@ -22,6 +22,7 @@ KIRO_ENGINES = ("v1", "v2", "v3")
 DEFAULT_TIMEOUT_MIN = 30
 DEFAULT_STALL_MIN = 10
 DEFAULT_MAX_JOBS = 4
+DEFAULT_IN_PLACE_MAX = 3
 # Used when the config has no routing key; an explicit routing list replaces it
 # whole. Keep identical to CFG_DEFAULT_ROUTING in lib/config.sh (a test checks).
 DEFAULT_ROUTING = (
@@ -35,6 +36,7 @@ DEFAULT_ROUTING = (
 TIMEOUT_MIN_BOUNDS = (1, 240)
 STALL_MIN_BOUNDS = (1, 120)
 MAX_JOBS_BOUNDS = (1, 32)
+IN_PLACE_MAX_BOUNDS = (1, 32)
 
 _MODEL_RE = re.compile(r"^[A-Za-z0-9._:/=\[\]-]+$")
 _DIGITS_RE = re.compile(r"[0-9]+")
@@ -169,6 +171,8 @@ class _Sanitiser(object):
                                      STALL_MIN_BOUNDS, DEFAULT_STALL_MIN),
             "max_jobs": self.int_in("limits.max_jobs", limits.get("max_jobs"),
                                     MAX_JOBS_BOUNDS, DEFAULT_MAX_JOBS),
+            "in_place_max": self.int_in("limits.in_place_max", limits.get("in_place_max"),
+                                        IN_PLACE_MAX_BOUNDS, DEFAULT_IN_PLACE_MAX),
         }
 
 
@@ -274,6 +278,9 @@ def _validate_limits(limits):
     max_jobs = limits.get("max_jobs")
     if max_jobs is not None and not _in_bounds(max_jobs, MAX_JOBS_BOUNDS):
         errors.append("limits.max_jobs: must be {}..{}".format(*MAX_JOBS_BOUNDS))
+    in_place_max = limits.get("in_place_max")
+    if in_place_max is not None and not _in_bounds(in_place_max, IN_PLACE_MAX_BOUNDS):
+        errors.append("limits.in_place_max: must be {}..{}".format(*IN_PLACE_MAX_BOUNDS))
     return errors
 
 

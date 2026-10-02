@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import {
   C, fmtT, clock, tileVM, tagFor, stageOf, spritePose, coinsStr, rows, hud, hofVM,
   focusJobVM, focusSessionVM, confirmVM, configDraftOps, setupVM, isDirty, crewOf, DEFAULT_TIMEOUT_MIN,
-  actionMsgVM, autoBenched, isBenched, benchOps,
+  actionMsgVM, autoBenched, isBenched, benchOps, BOUNDS,
 } from '../../static/vm.js';
 import { poseGrid, shadowOf } from '../../static/sprite.js';
 
@@ -13,6 +13,20 @@ const FIX = fileURLToPath(new URL('../fixtures/state.sample.json', import.meta.u
 const state = () => JSON.parse(readFileSync(FIX, 'utf8'));
 const job = (over = {}) => ({ ...state().jobs[0], ...over });
 const sess = (over = {}) => ({ ...state().sessions[0], ...over });
+const inPlace = (over = {}) => job({
+  mode: 'in-place', pose: 'review', status: 'ok', repo: 'app', branch: 'feature/fixes',
+  checkout: '/work/app', worktree: null, owns: ['src/**', 'docs/a b.md'],
+  commits: [
+    { sha: 'abcdef123456', subject: 'fix: first', shared: false, available: true,
+      files: [{ path: 'src/a.js', added: 3, deleted: 1 }, { path: 'src/b.js', added: 2, deleted: 0 }] },
+    { sha: '987654321abc', subject: 'fix: shared <script>', shared: true, available: false,
+      files: [{ path: 'docs/a b.md', added: null, deleted: 2 }] },
+  ],
+  uncommitted: ['src/unfinished.js'], outside_owns: ['outside.txt'],
+  unattributed: [{ sha: '1122334455667788990011223344556677889900', subject: 'fix: hand edit <script>',
+    files: [{ path: 'other.txt', added: 1, deleted: 0 }], shared: false }],
+  ...over,
+});
 
 const SESSION_KEYS = ['id', 'name', 'repo', 'branch', 'cwd', 'model', 'status', 'title', 'prompt', 'tool',
   'started', 'elapsed_s', 'tokens', 'score', 'replay', 'files', 'crew'];
@@ -203,6 +217,117 @@ test('focus job actions follow the pose', () => {
   assert.equal(f('play').readOnly, true);
 });
 
+test('in-place focus uses checkout and repeated owns metadata', () => {
+  const rec = inPlace({ owns: ['src/**', 'docs/a b.md', '<img src=x onerror=alert(1)>'] });
+  const before = JSON.stringify(rec);
+  const f = focusJobVM(rec, 0, '1');
+  assert.match(f.sub, /IN PLACE/);
+  assert.deepEqual(f.meta.map(m => m.k).slice(-2), ['CHECKOUT', 'OWNS']);
+  assert.equal(f.meta.at(-2).v, '/work/app');
+  assert.deepEqual(f.meta.at(-1).lines, rec.owns);
+  assert.equal(f.meta.at(-1).v, rec.owns.join('\n'));
+  assert.equal(JSON.stringify(rec), before);
+});
+
+test('in-place actions accept only review and never land or discard', () => {
+  for (const pose of ['play', 'pause', 'lost', 'queued', 'review', 'accepted', 'over', 'clear', 'ready', 'conflict', 'landed', 'discarded']) {
+    const f = focusJobVM(inPlace({ pose }), 0, '1');
+    assert.equal(f.canAccept, pose === 'review', pose);
+    assert.equal(f.canLand, false, pose);
+    assert.equal(f.canDiscard, false, pose);
+    assert.equal(f.canKill, ['play', 'pause', 'lost'].includes(pose), pose);
+    assert.equal(f.noActions, !f.canAccept && !f.canKill, pose);
+    assert.equal(f.showConflict, false, pose);
+    assert.equal(f.showLanded, false, pose);
+  }
+  assert.equal(focusJobVM(inPlace({ pose: 'accepted' }), 0, '1').actionNote, 'COMMITS REVIEWED · NO ACTIONS');
+});
+
+test('in-place review and accepted tags use clear sprites', () => {
+  for (const [pose, label, op] of [['review', 'READY TO REVIEW', 'blink'], ['accepted', 'ACCEPTED', '1']]) {
+    const rec = inPlace({ pose });
+    assert.equal(stageOf('worker', rec), 'clear');
+    assert.equal(spritePose('worker', rec), 'clear');
+    assert.equal(tagFor('worker', rec, 'blink').label, label);
+    assert.equal(tagFor('worker', rec, 'blink').op, op);
+    assert.match(tileVM(rec, 'worker', 0).sub, /IN PLACE/);
+  }
+});
+
+test('in-place commits retain subjects, short hashes, counts and availability', () => {
+  const rec = inPlace();
+  const before = JSON.stringify(rec);
+  const f = focusJobVM(rec, 0, '1');
+  assert.equal(f.showCommits, true);
+  assert.equal(f.commits.length, 2);
+  assert.deepEqual(f.commits[0], { sha: 'abcdef1', subject: 'fix: first', summary: '+5 −1 · 2 FILES', sharedLabel: null, availabilityLabel: null });
+  assert.deepEqual(f.commits[1], { sha: '9876543', subject: 'fix: shared <script>', summary: '+-- −2 · 1 FILES', sharedLabel: 'SHARED', availabilityLabel: 'UNAVAILABLE · NOT ON CURRENT BRANCH' });
+  const pending = focusJobVM(inPlace({ commits: [{ sha: 'pending', subject: 'wait', available: null, files: [] }] }), 0, '1');
+  assert.equal(pending.commits[0].availabilityLabel, null);
+  assert.equal(pending.commits[0].summary, '+0 −0 · 0 FILES');
+  assert.equal(JSON.stringify(rec), before);
+});
+
+test('in-place heuristic label appears only for shared or unattributed commits', () => {
+  const solo = { commits: [{ sha: 'solo', shared: false, files: [] }], unattributed: [] };
+  assert.equal(focusJobVM(inPlace(solo), 0, '1').heuristicLabel, null);
+  assert.match(focusJobVM(inPlace(), 0, '1').heuristicLabel, /Attribution is heuristic/);
+  assert.match(focusJobVM(inPlace({ ...solo, unattributed: [{ sha: 'other', subject: 'hand edit', files: [], shared: false }] }), 0, '1').heuristicLabel, /hashes may change after rebase/);
+  assert.match(focusJobVM(inPlace({ ...solo, commits: [{ ...solo.commits[0], shared: true }] }), 0, '1').heuristicLabel, /--owns/);
+  assert.equal(focusJobVM(inPlace({ commits: [], unattributed: [] }), 0, '1').heuristicLabel, null);
+});
+
+test('in-place warnings preserve each path and unattributed hash as text', () => {
+  const rec = inPlace();
+  const before = JSON.stringify(rec);
+  const f = focusJobVM(rec, 0, '1');
+  assert.deepEqual(f.warnings, [
+    { title: 'UNCOMMITTED OWNED PATHS', items: ['src/unfinished.js'] },
+    { title: 'PATHS OUTSIDE --owns', items: ['outside.txt'] },
+    { title: 'UNATTRIBUTED COMMITS', items: ['1122334455667788990011223344556677889900 fix: hand edit <script>'] },
+  ]);
+  assert.equal(JSON.stringify(rec), before);
+  const legacyAndIncomplete = focusJobVM(inPlace({ uncommitted: [], outside_owns: [], unattributed: [
+    'legacy-full-sha', { sha: 'full-sha' }, { subject: 'subject only' }, {},
+    { sha: { nested: true }, subject: ['not a subject'] }, { sha: 123, subject: false }, null, 12,
+  ] }), 0, '1');
+  assert.deepEqual(legacyAndIncomplete.warnings[0].items,
+    ['legacy-full-sha', 'full-sha --', '-- subject only', '-- --', '-- --', '-- --', '--', '--']);
+  for (const item of legacyAndIncomplete.warnings[0].items) assert.doesNotMatch(item, /\[object Object\]/);
+  assert.deepEqual(focusJobVM(inPlace({ uncommitted: [], outside_owns: [], unattributed: [] }), 0, '1').warnings, []);
+  assert.deepEqual(focusJobVM(job({ mode: 'write', commits: inPlace().commits, uncommitted: ['unexpected'] }), 0, '1').warnings, []);
+  assert.equal(focusJobVM(job(), 0, '1').showCommits, false);
+});
+
+test('in-place accept confirmation records review without git changes', () => {
+  const c = confirmVM('accept', inPlace());
+  assert.equal(c.title, 'ACCEPT COMMITS?');
+  assert.equal(c.body, 'Marks the 2 commits on feature/fixes as reviewed. Nothing in git changes.');
+  assert.equal(c.yes, 'ACCEPT');
+  assert.equal(c.hasFiles, false);
+  assert.deepEqual(c.files, []);
+  assert.equal(confirmVM('accept', inPlace({ commits: [] })).body, 'Marks the 0 commits on feature/fixes as reviewed. Nothing in git changes.');
+});
+
+test('in-place kill confirmation leaves partial changes uncommitted in the checkout', () => {
+  assert.equal(confirmVM('kill', inPlace({ id: 'J3', cli: 'kiro', pose: 'play' })).body,
+    "Stops KIRO job J3 now. Partial changes stay uncommitted in app's checkout.");
+});
+
+test('read and write action matrices retain their existing pose behavior', () => {
+  for (const mode of ['read', 'write']) {
+    for (const pose of ['play', 'pause', 'lost', 'queued', 'clear', 'over', 'ready', 'conflict', 'landed', 'discarded']) {
+      const f = focusJobVM(job({ mode, pose }), 0, '1');
+      assert.equal(f.canAccept, false, `${mode}/${pose}`);
+      assert.equal(f.canKill, ['play', 'pause', 'lost'].includes(pose), `${mode}/${pose}`);
+      assert.equal(f.canLand, pose === 'ready', `${mode}/${pose}`);
+      assert.equal(f.canDiscard, ['ready', 'conflict'].includes(pose), `${mode}/${pose}`);
+      assert.equal(f.readOnly, mode === 'read', `${mode}/${pose}`);
+      assert.equal(f.meta.at(-1).k, 'WORKTREE', `${mode}/${pose}`);
+    }
+  }
+});
+
 test('confirm modal copy', () => {
   const j = state().jobs.find(x => x.pose === 'ready');
   const land = confirmVM('land', j);
@@ -299,6 +424,29 @@ test('setup view model', () => {
   assert.equal(setupVM(CFG, CFG, null, true).workers[0].health, 'CHECKING…');
   assert.equal(isDirty(CFG, CFG), false);
   assert.equal(isDirty(configDraftOps.toggle(CFG, 'kiro'), CFG), true);
+});
+
+test('in-place setup limit projects and edits the existing config payload safely', () => {
+  const cfg = { ...CFG, limits: { ...CFG.limits, in_place_max: 3 }, custom: { keep: true } };
+  const before = JSON.stringify(cfg);
+  assert.deepEqual(BOUNDS.in_place_max, [1, 32]);
+  assert.equal(setupVM(cfg, cfg, null, false).lim.inPlaceMax, '3');
+  for (const [value, delta, expected] of [[3, 1, 4], [1, -1, 1], [32, 1, 32], [3, -100, 1], [3, 100, 32], ['3', 1, 4]]) {
+    const edited = configDraftOps.bumpLimit({ ...cfg, limits: { ...cfg.limits, in_place_max: value } }, 'in_place_max', delta);
+    assert.equal(edited.limits.in_place_max, expected, `${value}/${delta}`);
+    assert.deepEqual(edited.workers, cfg.workers);
+    assert.deepEqual(edited.routing, cfg.routing);
+    assert.deepEqual(edited.custom, cfg.custom);
+    assert.equal(edited.limits.max_jobs, 4);
+    assert.equal(edited.limits.stall_min, 10);
+  }
+  for (const value of [null, true, 'bad', 1.5]) {
+    const invalid = { ...cfg, limits: { ...cfg.limits, in_place_max: value } };
+    assert.deepEqual(configDraftOps.bumpLimit(invalid, 'in_place_max', 1), invalid);
+  }
+  assert.deepEqual(configDraftOps.bumpLimit(cfg, 'in_place_max', NaN), cfg);
+  assert.equal(JSON.stringify(cfg), before);
+  assert.equal(isDirty(configDraftOps.bumpLimit(cfg, 'in_place_max', 1), cfg), true);
 });
 
 test('sprite grids are 14x14 for every pose and kind', () => {

@@ -42,7 +42,7 @@ class ConfigTestCase(unittest.TestCase):
             self.assertIsNone(cfg["workers"][cli]["effort"])
             self.assertEqual(cfg["workers"][cli]["timeout_min"], 30)
             self.assertEqual(cfg["workers"][cli]["models"], [])
-        self.assertEqual(cfg["limits"], {"stall_min": 10, "max_jobs": 4})
+        self.assertEqual(cfg["limits"], {"stall_min": 10, "max_jobs": 4, "in_place_max": 3})
         self.assertEqual(cfg["routing"], [
             {"kind": "review", "prefer": "codex", "fallback": "copilot"},
             {"kind": "bulk-read", "prefer": "kiro", "fallback": "codex"},
@@ -58,6 +58,7 @@ class ConfigTestCase(unittest.TestCase):
         self.assertFalse(cfg["workers"]["codex"]["enabled"])
         self.assertEqual(cfg["workers"]["codex"]["timeout_min"], 30)
         self.assertTrue(cfg["workers"]["kiro"]["enabled"])
+        self.assertEqual(cfg["limits"], {"stall_min": 10, "max_jobs": 4, "in_place_max": 3})
 
     def test_load_unparsable_file_falls_back_to_defaults(self):
         data = self._write_raw(b"{not json")
@@ -73,6 +74,36 @@ class ConfigTestCase(unittest.TestCase):
         self.assertNotEqual(etag_a, etag_b)
 
     # -- validate ---------------------------------------------------------
+
+    def test_in_place_max_bounds_validation_and_sanitisation(self):
+        self.assertEqual(config.DEFAULT_IN_PLACE_MAX, 3)
+        self.assertEqual(config.IN_PLACE_MAX_BOUNDS, (1, 32))
+        for bad in (0, 33, True, False, 3.0, "3", "3.5", "x", " 3", "+3", "3\n", "\u0663"):
+            with self.subTest(bad=bad):
+                raw = {"limits": {"in_place_max": bad}}
+                self.assertEqual(config.validate(raw), ["limits.in_place_max: must be 1..32"])
+                if isinstance(bad, str) and bad == "3":
+                    self.assertEqual(config.raw_warnings(raw), [])
+                else:
+                    self.assertEqual(config.merge_defaults(raw)["limits"]["in_place_max"], 3)
+                    self.assertEqual(len(config.raw_warnings(raw)), 1)
+        for value in (1, 32):
+            self.assertEqual(config.validate({"limits": {"in_place_max": value}}), [])
+        for value, expected in ((None, 3), ("1", 1), ("032", 32)):
+            raw = {"limits": {"in_place_max": value}}
+            self._write_raw(raw)
+            cfg, _, warnings = config.load_with_warnings(self.path)
+            self.assertEqual(cfg["limits"]["in_place_max"], expected)
+            self.assertEqual(warnings, [])
+            self.assertEqual(config.validate(cfg), [])
+
+    def test_in_place_limit_matches_shell_default_and_bounds(self):
+        script = ('. "$1/common.sh"; . "$1/adapters.sh"; . "$1/config.sh"; '
+                  'printf "%s\\n%s\\n" "$DEFAULT_IN_PLACE_MAX" "$MAX_JOBS_MAX"')
+        output = subprocess.check_output(["/bin/bash", "-c", script, "bash", FARMOUT_LIB])
+        default, maximum = [int(line) for line in output.splitlines()]
+        self.assertEqual(config.DEFAULT_IN_PLACE_MAX, default)
+        self.assertEqual(config.IN_PLACE_MAX_BOUNDS, (1, maximum))
 
     def test_validate_accepts_defaults(self):
         cfg, _ = config.load(self.path)
@@ -222,7 +253,7 @@ class ConfigTestCase(unittest.TestCase):
 
     def test_null_and_digit_string_limits(self):
         cfg = config.merge_defaults({"limits": {"stall_min": None, "max_jobs": "10"}})
-        self.assertEqual(cfg["limits"], {"stall_min": 10, "max_jobs": 10})
+        self.assertEqual(cfg["limits"], {"stall_min": 10, "max_jobs": 10, "in_place_max": 3})
         self.assertEqual(config.raw_warnings({"limits": {"stall_min": None, "max_jobs": "10"}}), [])
         self.assertEqual(config.merge_defaults({"limits": {"stall_min": "7"}})["limits"]["stall_min"], 7)
 

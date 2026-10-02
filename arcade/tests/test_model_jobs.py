@@ -245,6 +245,149 @@ class PoseOverTest(ModelJobsTestCase):
         self.assertEqual(recs[0]["pose"], "over")
 
 
+class InPlaceRecordTest(ModelJobsTestCase):
+    def test_incomplete_metadata_never_runs_an_unscoped_diff(self):
+        for i, overrides in enumerate(({"checkout": None}, {"base": None}, {"owns": None},
+                                       {"owns": []}, {"owns": [None, "", 7]})):
+            meta = _base_meta("j%d" % i, mode="in-place", sup_pid=123,
+                              checkout="/checkout", base="abc", owns=["src/**"],
+                              commits=None, uncommitted=None, outside_owns=None, unattributed=None)
+            meta.update(overrides)
+            _write_job(self.home, meta["id"], meta=meta)
+        git = mock.Mock()
+        snap = model_jobs.JobsModel(self.home, pid_alive=lambda pid: True, run_git=git).snapshot(NOW_MS, 60)
+        self.assertEqual(len(snap["jobs"]), 5)
+        for rec in snap["jobs"]:
+            self.assertIsNone(rec["files"])
+            for field in ("commits", "uncommitted", "outside_owns", "unattributed"):
+                self.assertEqual(rec[field], [])
+        git.assert_not_called()
+
+    def test_commit_availability_refreshes_after_branch_changes(self):
+        _write_job(self.home, "j1", meta=_base_meta(
+            "j1", mode="in-place", status="ok", ended=_iso(2026, 9, 23, 14, 30, 0),
+            checkout="/checkout", commits=[{"sha": "old", "files": []}]))
+        clock = [0]
+        git = mock.Mock(return_value="")
+        model = model_jobs.JobsModel(self.home, run_git=git, clock=lambda: clock[0])
+        self.assertTrue(model.snapshot(NOW_MS, 60)["jobs"][0]["commits"][0]["available"])
+        git.return_value = None
+        clock[0] = model_jobs.FILES_REFRESH_S - 1
+        self.assertTrue(model.snapshot(NOW_MS, 60)["jobs"][0]["commits"][0]["available"])
+        self.assertEqual(git.call_count, 2)
+        clock[0] += 1
+        self.assertFalse(model.snapshot(NOW_MS, 60)["jobs"][0]["commits"][0]["available"])
+        self.assertEqual(git.call_count, 3)
+
+    def test_existing_commit_off_current_branch_is_unavailable(self):
+        _write_job(self.home, "j1", meta=_base_meta(
+            "j1", mode="in-place", status="ok", ended=_iso(2026, 9, 23, 14, 30, 0),
+            checkout="/checkout", commits=[{"sha": "old", "subject": "rebased", "files": []}]))
+        git = mock.Mock(side_effect=lambda args, cwd: "" if args[0] == "cat-file" else None)
+        rec = model_jobs.JobsModel(self.home, run_git=git).snapshot(NOW_MS, 60)["jobs"][0]
+        self.assertFalse(rec["commits"][0]["available"])
+        self.assertEqual(git.call_args_list, [mock.call(["cat-file", "-e", "old^{commit}"], "/checkout"),
+                                             mock.call(["merge-base", "--is-ancestor", "old", "HEAD"], "/checkout")])
+
+    def test_missing_commit_is_unavailable_but_snapshot_files_survive(self):
+        commits = [{"sha": "missing", "subject": "before rebase", "shared": False,
+                    "files": [{"path": "owned.py", "added": 2, "deleted": 1}]}]
+        _write_job(self.home, "j1", meta=_base_meta(
+            "j1", mode="in-place", status="ok", ended=_iso(2026, 9, 23, 14, 30, 0),
+            checkout="/checkout", commits=commits))
+        git = mock.Mock(return_value=None)
+        model = model_jobs.JobsModel(self.home, run_git=git)
+        snap = model.snapshot(NOW_MS, 60)
+        rec = snap["jobs"][0]
+        self.assertEqual(rec["files"], [{"n": "owned.py", "a": 2, "d": 1}])
+        self.assertFalse(rec["commits"][0]["available"])
+        self.assertEqual(rec["commits"][0]["subject"], "before rebase")
+        git.assert_called_once_with(["cat-file", "-e", "missing^{commit}"], "/checkout")
+        self.assertEqual(snap["errors"], [])
+
+    def test_running_files_use_checkout_and_all_owned_pathspecs(self):
+        owns = ["src/**", ":(exclude)src/vendor/**", "a space.txt"]
+        _write_job(self.home, "j1", meta=_base_meta(
+            "j1", mode="in-place", sup_pid=123, checkout="/checkout", repo="/other",
+            worktree="/never-use", base="abc", owns=owns))
+        calls = []
+
+        def git(args, cwd):
+            calls.append((args, cwd))
+            return ("2\t1\tsrc/a.py\n-\t-\tblob.bin\n" if "abc..HEAD" in args
+                    else "3\t2\tsrc/a.py\n1\t0\tblob.bin\n1\t0\ta space.txt\n")
+
+        model = model_jobs.JobsModel(self.home, pid_alive=lambda pid: True, run_git=git)
+        rec = model.snapshot(NOW_MS, 60)["jobs"][0]
+        self.assertEqual(calls, [(["diff", "--numstat", "abc..HEAD", "--"] + owns, "/checkout"),
+                                 (["diff", "--numstat", "--"] + owns, "/checkout")])
+        self.assertEqual(rec["files"], [{"n": "a space.txt", "a": 1, "d": 0},
+                                      {"n": "blob.bin", "a": None, "d": None},
+                                      {"n": "src/a.py", "a": 5, "d": 3}])
+        self.assertIsNone(rec["worktree"])
+        model.snapshot(NOW_MS, 60)
+        self.assertEqual(len(calls), 2, "running measurement must retain the refresh interval")
+
+    def test_ended_files_use_only_stored_commits_and_merge_unknown_counts(self):
+        commits = [
+            {"sha": "abc", "subject": "first", "shared": True, "files": [
+                {"path": "z.txt", "added": 2, "deleted": 1},
+                {"path": "binary.bin", "added": None, "deleted": None}]},
+            {"sha": "def", "subject": "second", "shared": False, "files": [
+                {"path": "z.txt", "added": 3, "deleted": 2},
+                {"path": "binary.bin", "added": 4, "deleted": 0},
+                {"path": "a.txt", "added": 1, "deleted": 0}]}]
+        _write_job(self.home, "j1", meta=_base_meta(
+            "j1", mode="in-place", status="ok", ended=_iso(2026, 9, 23, 14, 30, 0),
+            checkout="/checkout", worktree="/never-use", base="old", commits=commits,
+            owns=["z.txt"], uncommitted=["z.txt"], outside_owns=["a.txt"],
+            unattributed=[{"sha": "user", "files": [{"path": "excluded.txt", "added": 9, "deleted": 0}]}]),
+            diff_patch="must not read\n")
+        calls = []
+
+        def git(args, cwd):
+            calls.append((args, cwd))
+            self.assertIn(args[0], ("cat-file", "merge-base"))
+            self.assertEqual(cwd, "/checkout")
+            return ""
+
+        model = model_jobs.JobsModel(self.home, run_git=git)
+        rec = model.snapshot(NOW_MS, 60)["jobs"][0]
+        self.assertEqual(rec["files"], [{"n": "a.txt", "a": 1, "d": 0},
+                                      {"n": "binary.bin", "a": None, "d": None},
+                                      {"n": "z.txt", "a": 5, "d": 3}])
+        self.assertEqual(rec["owns"], ["z.txt"])
+        self.assertEqual(rec["uncommitted"], ["z.txt"])
+        self.assertEqual(rec["outside_owns"], ["a.txt"])
+        self.assertEqual(rec["unattributed"][0]["sha"], "user")
+        self.assertEqual(rec["commits"][0]["subject"], "first")
+        self.assertTrue(rec["commits"][0]["shared"])
+
+    def test_poses_membership_and_metadata_defaults(self):
+        for job_id, status, land, ended in (
+                ("running", "running", None, None),
+                ("review", "ok", None, _iso(2026, 9, 23, 14, 30, 0)),
+                ("accepted", "ok", "accepted", _iso(2026, 9, 23, 14, 31, 0)),
+                ("failed", "failed", None, _iso(2026, 9, 23, 14, 32, 0))):
+            _write_job(self.home, job_id, meta=_base_meta(
+                job_id, mode="in-place", status=status, land=land, ended=ended,
+                sup_pid=123, started=_iso(2026, 9, 23, 14, 59, 0),
+                source_branch="feature/lane", checkout="/checkout", worktree="/never-use"), log_lines=[])
+        model = model_jobs.JobsModel(self.home, pid_alive=lambda pid: True, run_git=lambda args, cwd: "")
+        snap = model.snapshot(NOW_MS, stall_min=60)
+        self.assertEqual({r["id"] for r in snap["jobs"]}, {"running", "review"})
+        self.assertEqual([r["id"] for r in snap["hof"]], ["failed", "accepted"])
+        records = {r["id"]: r for r in snap["jobs"] + snap["hof"]}
+        self.assertEqual({key: rec["pose"] for key, rec in records.items()},
+                         {"running": "play", "review": "review", "accepted": "accepted", "failed": "over"})
+        for rec in records.values():
+            self.assertIsNone(rec["worktree"])
+            self.assertEqual(rec["checkout"], "/checkout")
+            self.assertEqual(rec["branch"], "feature/lane")
+            for field in ("commits", "owns", "uncommitted", "outside_owns", "unattributed"):
+                self.assertEqual(rec[field], [])
+
+
 class TitleAndBriefTest(ModelJobsTestCase):
     def test_title_present_in_meta_is_used_verbatim(self):
         meta = _base_meta("j1", title="Explicit title")
@@ -423,6 +566,37 @@ class GitRepoTestCase(ModelJobsTestCase):
 
 
 class FilesFieldTest(GitRepoTestCase):
+    def test_running_in_place_excludes_outside_dirt_with_git_native_owns(self):
+        repo, base = self._init_repo()
+        with open(os.path.join(repo, "outside.txt"), "w") as f:
+            f.write("original\n")
+        self._git(["add", "outside.txt"], repo)
+        self._git(["commit", "-qm", "outside baseline"], repo)
+        base = self._git(["rev-parse", "HEAD"], repo, capture=True)
+        with open(os.path.join(repo, "tracked.txt"), "a") as f:
+            f.write("committed\n")
+        self._git(["add", "tracked.txt"], repo)
+        self._git(["commit", "-qm", "owned change"], repo)
+        with open(os.path.join(repo, "tracked.txt"), "a") as f:
+            f.write("uncommitted\n")
+        with open(os.path.join(repo, "outside.txt"), "w") as f:
+            f.write("user work\n")
+        _write_job(self.home, "j1", meta=_base_meta(
+            "j1", mode="in-place", sup_pid=123, checkout=repo, base=base,
+            owns=[":(glob)*.txt", ":(exclude)outside.txt"]))
+        before = subprocess.check_output(["git", "diff", "--binary"], cwd=repo)
+        index_path = os.path.join(repo, ".git", "index")
+        with open(index_path, "rb") as f:
+            index_before = f.read()
+        model = model_jobs.JobsModel(self.home, pid_alive=lambda pid: True)
+        rec = model.snapshot(NOW_MS, 60)["jobs"][0]
+        self.assertEqual(rec["files"], [{"n": "tracked.txt", "a": 2, "d": 0}])
+        self.assertEqual(subprocess.check_output(["git", "diff", "--binary"], cwd=repo), before)
+        with open(index_path, "rb") as f:
+            self.assertEqual(f.read(), index_before)
+        with open(os.path.join(repo, "outside.txt")) as f:
+            self.assertEqual(f.read(), "user work\n")
+
     def test_read_job_files_is_null(self):
         meta = _base_meta("jr", mode="read", status="running", sup_pid=123)
         _write_job(self.home, "jr", meta=meta, log_lines=[])
@@ -836,6 +1010,102 @@ class BackgroundFilesTest(ModelJobsTestCase):
         self.assertEqual([None] * 8, [r["files"] for r in snap["jobs"]], "unmeasured until the refresher reports")
         self.assertTrue(self._wait_for(lambda: callers))
         self.assertNotIn(threading.current_thread(), callers)
+
+    def test_in_place_measurement_and_final_commit_checks_stay_in_background(self):
+        release = threading.Event()
+        callers = []
+
+        def git(args, cwd):
+            callers.append(threading.current_thread())
+            self.assertEqual(cwd, "/checkout")
+            release.wait(self.SETTLE_S)
+            if args[0] == "diff":
+                return "2\t0\towned.py\n" if "abc..HEAD" in args else "1\t0\towned.py\n"
+            return ""
+
+        meta = _base_meta("j1", mode="in-place", sup_pid=123, checkout="/checkout",
+                          base="abc", owns=["owned.py"])
+        job_dir = _write_job(self.home, "j1", meta=meta)
+        model = self._model(git)
+        started = time.monotonic()
+        rec = model.snapshot(NOW_MS, 60)["jobs"][0]
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertIsNone(rec["files"])
+        release.set()
+        self.assertTrue(self._wait_for(lambda: model.snapshot(NOW_MS, 60)["jobs"][0]["files"] is not None))
+        self.assertEqual(model.snapshot(NOW_MS, 60)["jobs"][0]["files"], [{"n": "owned.py", "a": 3, "d": 0}])
+        meta.update(status="ok", ended=_iso(2026, 9, 23, 14, 30, 0), commits=[
+            {"sha": "end", "files": [{"path": "owned.py", "added": 8, "deleted": 1}]}])
+        with open(os.path.join(job_dir, "meta.json"), "w") as f:
+            json.dump(meta, f)
+        self.assertTrue(self._wait_for(lambda: model.snapshot(NOW_MS, 60)["jobs"][0]["commits"][0]["available"] is True))
+        self.assertEqual(model.snapshot(NOW_MS, 60)["jobs"][0]["files"], [{"n": "owned.py", "a": 8, "d": 1}])
+        self.assertNotIn(threading.current_thread(), callers)
+
+    def test_ended_in_place_files_never_reuse_the_running_measurement(self):
+        meta = _base_meta("j1", mode="in-place", sup_pid=123, checkout="/checkout",
+                          base="abc", owns=["owned.py"])
+        job_dir = _write_job(self.home, "j1", meta=meta)
+        model = self._model(lambda args, cwd: "1\t0\ttransient.py\n")
+        model.snapshot(NOW_MS, 60)
+        self.assertTrue(self._wait_for(lambda: model.snapshot(NOW_MS, 60)["jobs"][0]["files"] is not None))
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def held_git(args, cwd):
+            release.wait(self.SETTLE_S)
+            return ""
+
+        model._run_git = held_git
+        meta.update(status="ok", ended=_iso(2026, 9, 23, 14, 30, 0), commits=[
+            {"sha": "end", "files": [{"path": "final.py", "added": 8, "deleted": 1}]}])
+        with open(os.path.join(job_dir, "meta.json"), "w") as f:
+            json.dump(meta, f)
+        rec = model.snapshot(NOW_MS, 60)["jobs"][0]
+        self.assertEqual(rec["files"], [{"n": "final.py", "a": 8, "d": 1}])
+        self.assertIsNone(rec["commits"][0]["available"])
+
+    def test_two_step_finalization_rechecks_changed_commits_and_checkout_immediately(self):
+        meta = _base_meta("j1", mode="in-place", status="ok", checkout="/checkout",
+                          ended=_iso(2026, 9, 23, 14, 30, 0), commits=[])
+        job_dir = _write_job(self.home, "j1", meta=meta)
+        git = mock.Mock(return_value="")
+        # Drive refresher passes manually so no scheduling race can hide
+        # the pending state between a metadata write and its measurement.
+        with mock.patch.object(model_jobs.JobsModel, "_refresh_loop", return_value=None):
+            model = self._model(git)
+        model.snapshot(NOW_MS, 60)
+        model._refresh_due()
+        self.assertEqual(model._files_cache["j1"]["commits"], [])
+
+        commit = {"sha": "end", "subject": "finished", "files": [
+            {"path": "final.py", "added": 8, "deleted": 1}]}
+        meta["commits"] = [commit]
+        with open(os.path.join(job_dir, "meta.json"), "w") as f:
+            json.dump(meta, f)
+        model._files_wake.clear()
+        rec = model.snapshot(NOW_MS, 60)["jobs"][0]
+        self.assertEqual(rec["files"], [{"n": "final.py", "a": 8, "d": 1}])
+        self.assertEqual(rec["commits"], [dict(commit, available=None)])
+        git.assert_not_called()
+        self.assertTrue(model._files_wake.is_set(), "changed commits must wake the refresher immediately")
+        model._refresh_due()
+        self.assertTrue(model.snapshot(NOW_MS, 60)["jobs"][0]["commits"][0]["available"])
+        self.assertEqual(git.call_args_list, [mock.call(["cat-file", "-e", "end^{commit}"], "/checkout"),
+                                             mock.call(["merge-base", "--is-ancestor", "end", "HEAD"], "/checkout")])
+
+        meta["checkout"] = "/changed-checkout"
+        with open(os.path.join(job_dir, "meta.json"), "w") as f:
+            json.dump(meta, f)
+        model._files_wake.clear()
+        rec = model.snapshot(NOW_MS, 60)["jobs"][0]
+        self.assertEqual(rec["commits"], [dict(commit, available=None)])
+        self.assertEqual(git.call_count, 2, "snapshot must not run the new Git measurement inline")
+        self.assertTrue(model._files_wake.is_set(), "changed checkout must wake the refresher immediately")
+        git.return_value = None
+        model._refresh_due()
+        self.assertFalse(model.snapshot(NOW_MS, 60)["jobs"][0]["commits"][0]["available"])
+        self.assertEqual(git.call_args, mock.call(["cat-file", "-e", "end^{commit}"], "/changed-checkout"))
 
     def test_refresher_result_is_served_on_the_next_snapshot(self):
         def fake_git(args, cwd):

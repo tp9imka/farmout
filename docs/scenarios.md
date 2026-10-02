@@ -1,6 +1,6 @@
 # Usage scenarios
 
-Each scenario shows two things: what you would say to Claude Code (the `farmout` skill takes it from there), and the command it ends up running, in case you'd rather drive by hand. Every brief is a small Markdown file in the shape the skill uses: **Task / Context / Constraints / Deliverable**. The worker sees nothing but that file and the repo snapshot.
+Each scenario shows two things: what you would say to Claude Code (the `farmout` skill takes it from there), and the command it ends up running, in case you'd rather drive by hand. Every brief is a small Markdown file in the shape the skill uses: **Task / Context / Constraints / Deliverable**. The worker sees that file and the repo snapshot, or the live checkout when you explicitly choose in-place mode.
 
 ---
 
@@ -107,12 +107,56 @@ farmout run kiro --write --with notes/yesterday.md --brief morning.md
 
 The worker writes today's note into its worktree. You look at it in the arcade, then press LAND.
 
+## 9. A fix round on one PR, four lanes, one branch
+
+All four review fixes belong on the current feature branch, and you want the
+workers to commit there while Claude reviews each lane:
+
+> *"Run four fix lanes in place on this PR. Give each disjoint paths, review each commit and accept it, then run the full gate once."*
+
+Prepare self-contained briefs outside the checkout, with these disjoint owns
+sets and focused tests (example project uses npm):
+
+| Lane | Owned paths | Lane-local test |
+|---|---|---|
+| Export | `src/export`, `tests/export` | `npm test -- tests/export` |
+| Import | `src/import`, `tests/import` | `npm test -- tests/import` |
+| Auth | `src/auth`, `tests/auth` | `npm test -- tests/auth` |
+| Cache | `src/cache`, `tests/cache` | `npm test -- tests/cache` |
+
+```bash
+farmout run codex --in-place --owns src/export --owns tests/export --queue --brief "$BRIEFS/export.md" &
+farmout run kiro --in-place --owns src/import --owns tests/import --queue --brief "$BRIEFS/import.md" &
+farmout run codex --in-place --owns src/auth --owns tests/auth --queue --brief "$BRIEFS/auth.md" &
+farmout run kiro --in-place --owns src/cache --owns tests/cache --queue --brief "$BRIEFS/cache.md" &
+wait
+```
+
+`BRIEFS` points to your prepared brief directory. With the default
+`in_place_max: 3`, the fourth lane waits; the global `max_jobs` also applies.
+Each brief instructs `git add <explicit owned files>` followed by
+`git commit -m "<lane message>" -- <explicit owned files>`, never broad staging
+or committing, switching branches or pushing. Reserve future new filenames:
+the tracked-file overlap guard cannot detect future untracked-file overlap.
+
+For each returned job id, check `farmout status <id>` is `ok`, read
+`farmout result <id>`, inspect its commit list and all warnings, read every
+full diff with `git show <sha>`, and verify the lane-local test result. Review
+touched paths yourself: attribution is heuristic, and a shared or unattributed
+commit needs extra review. Then run `farmout accept <id>` for that lane.
+Acceptance changes only metadata; the worker's commits are already on the
+branch. Reject a lane by manually reviewing and reverting its commits with Git;
+`land` and `discard` refuse in-place jobs, and v1 has no `farmout revert`.
+
+Once all four lanes pass review and are accepted, Claude runs the full gate
+once on the combined branch, for example `npm run lint && npm test && npm run build`.
+
 ---
 
 ## Writing briefs that work
 
 - **Self-contained.** The worker saw none of your conversation. Name the paths, conventions and setup it needs.
-- **Never put your checkout's absolute path in a brief.** An auto-approved worker would edit it directly. `farmout run` refuses such briefs.
+- **Worktree briefs must not contain your checkout's absolute path.** An auto-approved worker would edit it directly. `farmout run` refuses such briefs in worktree mode; in-place briefs intentionally describe the live checkout.
 - **Ask for a checkable deliverable.** For example `path:line - problem - why`, or "a final message listing each changed file and why".
 - **Visual work needs mechanical checks.** A worker can't see what it draws, so put checks in the brief: element overlap, text overflow, arrowheads present, a headless render. Render it yourself before landing.
 - **Invite the worker to overturn the brief.** Add "if a premise here is wrong, say so first". The best findings are often that your framing was off.

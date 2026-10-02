@@ -11,7 +11,7 @@ export const REPLAY_SHOWN = 12;
 export const HOF_SHOWN = 10;
 export const TIMEOUT_STEP = 5;
 export const DEFAULT_TIMEOUT_MIN = 30;
-export const BOUNDS = { timeout_min: [1, 240], stall_min: [1, 120], max_jobs: [1, 32] };
+export const BOUNDS = { timeout_min: [1, 240], stall_min: [1, 120], max_jobs: [1, 32], in_place_max: [1, 32] };
 
 const SESSION_STAGES = ['play', 'think', 'turn', 'idle'];
 const HEALTH = { ok: 'OK', 'not-verified': 'NOT VERIFIED', 'logged-out': 'LOGGED OUT', missing: 'MISSING' };
@@ -57,7 +57,7 @@ export function stageOf(kind, rec) {
 export function spritePose(kind, rec) {
   if (kind === 'claude') { const st = stageOf(kind, rec); return st === 'raw' ? 'idle' : st; }
   if (rec.pose === 'queued') return 'idle';
-  return rec.pose === 'ready' || rec.pose === 'landed' ? 'clear' : rec.pose;
+  return ['ready', 'landed', 'review', 'accepted'].includes(rec.pose) ? 'clear' : rec.pose;
 }
 
 export const overReason = rec => up(rec.status);
@@ -78,6 +78,7 @@ export function tagFor(kind, rec, blink) {
   if (st === 'over') return T('OVER · ' + overReason(rec), 'transparent', C.R, C.R);
   return {
     ready: T('READY TO LAND', C.W, C.INK, C.W, true), landed: T('LANDED', C.W, C.INK, C.W),
+    review: T('READY TO REVIEW', C.W, C.INK, C.W, true), accepted: T('ACCEPTED', C.W, C.INK, C.W),
     conflict: T('CONFLICT', 'transparent', C.AMB, C.AMB), discarded: T('DISCARDED', 'transparent', C.G4, C.G6),
   }[rec.pose] || T('CLEAR', C.W, C.INK, C.W);
 }
@@ -112,7 +113,7 @@ export function tileVM(rec, kind, f, opts = {}) {
   return {
     real: true, id: rec.id, statusKey: dash(rec.status), kind, name: isC ? 'CLAUDE' : up(rec.cli), isClaude: isC, isWorker: !isC, isTurn: isC && st === 'turn',
     badge: isC ? 'CONTROL' : 'PLAYER', badgeBg: isC ? C.R : 'transparent', badgeBd: isC ? C.R : C.G4,
-    sub: (isC ? 'SESSION' : `${up(rec.kind)} · ${up(rec.mode)}`) + (rec.repo ? ` · ${up(rec.repo)}` : ''),
+    sub: (isC ? 'SESSION' : `${up(rec.kind)} · ${rec.mode === 'in-place' ? 'IN PLACE' : up(rec.mode)}`) + (rec.repo ? ` · ${up(rec.repo)}` : ''),
     repo: dash(rec.repo), branch: dash(rec.branch),
     model: rec.model ? rec.model : isC ? DASH : 'DEFAULT',
     tool: rec.tool ? rec.tool : st === 'turn' ? 'WAITING' : DASH,
@@ -138,10 +139,30 @@ const checkoutOf = rec => `${dash(rec.repo)}'s current checkout`;
 
 const filesVM = files => (files || []).map(x => ({ n: dash(x.n), a: dash(x.a), d: dash(x.d) }));
 const replayVM = replay => (replay || []).slice(-REPLAY_SHOWN).map(l => ({ t: clock(l.t), m: dash(l.m) }));
+const list = value => Array.isArray(value) ? value : [];
+const commitsVM = commits => list(commits).filter(c => c && typeof c === 'object').map(c => {
+  const files = list(c.files);
+  const count = key => files.every(x => x && Number.isInteger(x[key]) && x[key] >= 0)
+    ? files.reduce((n, x) => n + x[key], 0) : null;
+  return {
+    sha: dash(c.sha).slice(0, 7), subject: dash(c.subject),
+    summary: `+${dash(count('added'))} −${dash(count('deleted'))} · ${files.length} FILES`,
+    sharedLabel: c.shared === true ? 'SHARED' : null,
+    availabilityLabel: c.available === false ? 'UNAVAILABLE · NOT ON CURRENT BRANCH' : null,
+  };
+});
+const HEURISTIC_LABEL = 'Attribution is heuristic: exact when concurrent lanes keep to their --owns paths; hashes may change after rebase.';
+const unattributedText = commit => {
+  if (typeof commit === 'string') return dash(commit);
+  if (!commit || typeof commit !== 'object') return DASH;
+  const text = value => typeof value === 'string' ? dash(value) : DASH;
+  return `${text(commit.sha)} ${text(commit.subject)}`;
+};
 
 export function focusJobVM(rec, f, blink) {
   const o = tileVM(rec, 'worker', f, { blink });
   const st = stageOf('worker', rec);
+  const inPlace = rec.mode === 'in-place';
   const nFiles = dash(fileCount(rec));
   o.brief = dash(rec.brief);
   o.replay = replayVM(rec.replay);
@@ -149,17 +170,28 @@ export function focusJobVM(rec, f, blink) {
   o.meta = [
     { k: 'CLI', v: up(rec.cli) }, { k: 'MODEL', v: rec.model || 'DEFAULT' }, { k: 'MODE', v: up(rec.mode) }, { k: 'TIMEOUT', v: fmtT(rec.timeout_s) },
     { k: 'JOB ID', v: dash(rec.id) }, { k: 'TOKENS', v: fmtN(rec.tokens) }, { k: 'COINS', v: coinsStr(rec.coins) }, { k: 'TASK KIND', v: dash(rec.kind) },
-    { k: 'WORKTREE', v: dash(rec.worktree), span: '1 / -1' },
+    ...(inPlace ? [
+      { k: 'CHECKOUT', v: dash(rec.checkout), span: '1 / -1', wrap: true },
+      { k: 'OWNS', v: list(rec.owns).map(String).join('\n') || DASH, lines: list(rec.owns).map(String), span: '1 / -1' },
+    ] : [{ k: 'WORKTREE', v: dash(rec.worktree), span: '1 / -1' }]),
   ].map(m => ({ span: 'auto', ...m }));
   o.readOnly = rec.mode === 'read';
   o.canKill = st === 'play' || st === 'pause' || st === 'lost';
-  o.canLand = rec.pose === 'ready';
-  o.canDiscard = rec.pose === 'ready' || rec.pose === 'conflict';
-  o.noActions = !o.canKill && !o.canLand && !o.canDiscard;
-  o.actionNote = st === 'queued' ? 'QUEUED · WAITING FOR A SLOT' : st === 'over' ? 'JOB ENDED · NO ACTIONS' : rec.pose === 'landed' ? 'PATCH LANDED · NO ACTIONS'
-    : rec.pose === 'discarded' ? 'WORKTREE DISCARDED · NO ACTIONS' : 'READ JOB · NOTHING TO LAND';
-  o.showConflict = rec.pose === 'conflict';
-  o.showLanded = rec.pose === 'landed';
+  o.canAccept = inPlace && rec.pose === 'review';
+  o.canLand = !inPlace && rec.pose === 'ready';
+  o.canDiscard = !inPlace && (rec.pose === 'ready' || rec.pose === 'conflict');
+  o.noActions = !o.canKill && !o.canLand && !o.canDiscard && !o.canAccept;
+  o.actionNote = st === 'queued' ? 'QUEUED · WAITING FOR A SLOT' : st === 'over' ? 'JOB ENDED · NO ACTIONS'
+    : inPlace ? rec.pose === 'accepted' ? 'COMMITS REVIEWED · NO ACTIONS' : 'IN PLACE · NO ACTIONS'
+      : rec.pose === 'landed' ? 'PATCH LANDED · NO ACTIONS' : rec.pose === 'discarded' ? 'WORKTREE DISCARDED · NO ACTIONS' : 'READ JOB · NOTHING TO LAND';
+  o.showConflict = !inPlace && rec.pose === 'conflict';
+  o.showLanded = !inPlace && rec.pose === 'landed';
+  o.showCommits = inPlace;
+  o.commits = inPlace ? commitsVM(rec.commits) : [];
+  o.heuristicLabel = inPlace && (list(rec.commits).some(c => c && c.shared === true) || list(rec.unattributed).length > 0) ? HEURISTIC_LABEL : null;
+  o.warnings = inPlace ? [
+    ['UNCOMMITTED OWNED PATHS', rec.uncommitted], ['PATHS OUTSIDE --owns', rec.outside_owns], ['UNATTRIBUTED COMMITS', list(rec.unattributed).map(unattributedText)],
+  ].map(([title, items]) => ({ title, items: list(items).map(String) })).filter(w => w.items.length > 0) : [];
   o.error = rec.error ? String(rec.error) : null;
   o.out = (rec.out || []).map(String);
   o.landedMsg = `${nFiles} files applied to ${checkoutOf(rec)} as uncommitted changes.`;
@@ -184,8 +216,10 @@ export function focusSessionVM(rec, state, f, blink) {
 
 export function confirmVM(type, rec) {
   const cli = up(rec.cli), id = dash(rec.id), files = filesVM(rec.files), n = dash(fileCount(rec));
-  const killNote = rec.mode === 'write' ? ' Partial changes stay in its worktree.' : '';
+  const killNote = rec.mode === 'in-place' ? ` Partial changes stay uncommitted in ${dash(rec.repo)}'s checkout.`
+    : rec.mode === 'write' ? ' Partial changes stay in its worktree.' : '';
   return {
+    accept: { title: 'ACCEPT COMMITS?', body: `Marks the ${list(rec.commits).length} commits on ${dash(rec.branch)} as reviewed. Nothing in git changes.`, yes: 'ACCEPT', hasFiles: false, files: [] },
     land: { title: 'LAND PATCH?', body: `Applies ${n} files from ${cli} job ${id} to ${checkoutOf(rec)} as uncommitted changes. Nothing is committed.`, yes: 'CONFIRM LAND', hasFiles: true, files },
     discard: { title: 'DISCARD PATCH?', body: `Deletes the worktree for ${cli} job ${id}. The patch cannot be recovered.`, yes: 'DISCARD', hasFiles: true, files },
     kill: { title: 'KILL JOB?', body: `Stops ${cli} job ${id} now.${killNote}`, yes: 'KILL', hasFiles: false, files: [] },
@@ -298,7 +332,15 @@ export const configDraftOps = {
   }),
   delRule: (cfg, i) => edit(cfg, d => { d.routing.splice(i, 1); }),
   addRule: cfg => edit(cfg, d => { d.routing.push({ kind: 'review', prefer: 'codex', fallback: null }); }),
-  bumpLimit: (cfg, key, delta) => edit(cfg, d => { if (d.limits[key] != null) d.limits[key] = clamp(d.limits[key] + delta, BOUNDS[key]); }),
+  bumpLimit: (cfg, key, delta) => edit(cfg, d => {
+    if (!d.limits || d.limits[key] == null || !BOUNDS[key]) return;
+    if (key === 'in_place_max') {
+      // Config loads accept digit strings; never concatenate them or save NaN.
+      const v = typeof d.limits[key] === 'string' && /^\d+$/.test(d.limits[key]) ? Number(d.limits[key]) : d.limits[key];
+      if (typeof v !== 'number' || !Number.isSafeInteger(v) || !Number.isSafeInteger(delta)) return;
+      d.limits[key] = clamp(v + delta, BOUNDS[key]);
+    } else d.limits[key] = clamp(d.limits[key] + delta, BOUNDS[key]);
+  }),
 };
 
 export const isDirty = (draft, saved) => JSON.stringify(draft) !== JSON.stringify(saved);
@@ -333,7 +375,7 @@ export function setupVM(draft, saved, doctor, checking) {
       upOp: i === 0 ? '0.3' : '1', downOp: i === routing.length - 1 ? '0.3' : '1',
     })),
     kinds: KINDS, cliOpts, fbOpts: [{ v: DASH, l: 'NONE' }].concat(cliOpts),
-    lim: { stall: dash((draft.limits || {}).stall_min), maxJobs: dash((draft.limits || {}).max_jobs) },
+    lim: { stall: dash((draft.limits || {}).stall_min), maxJobs: dash((draft.limits || {}).max_jobs), inPlaceMax: dash((draft.limits || {}).in_place_max) },
     dirty: isDirty(draft, saved),
   };
 }

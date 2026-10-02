@@ -11,6 +11,11 @@ while IFS= read -r line; do
     echo-brief) printf '%s\n' "$brief" ;;
     cat) cat "$1" ;;
     write) f="$1"; shift; printf '%s\n' "$*" > "$f" ;;
+    commit)
+      message="$1"; shift
+      for f in "$@"; do printf '%s\n' "$message" > "$f"; done
+      git add -- "$@" && git commit -m "$message" -- "$@" || exit $? ;;
+    checkout) git checkout "$1" || exit $? ;;
     sed) e="$1"; f="$2"; sed "$e" "$f" > "$f.fake-tmp" && mv "$f.fake-tmp" "$f" ;;
     trailing-ws) printf 'four \n' >> "$1" ;;
     ln) ln -s "$1" "$2" ;;

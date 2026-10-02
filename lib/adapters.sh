@@ -41,9 +41,10 @@ adapter_effective_effort() { # cli model effort
 # newlines is never round-tripped through text. `effort` is already resolved
 # (adapter_effective_effort is called once, by the caller) - this function
 # must not call it again.
-_adapter_build_argv() { # cli jobdir worktree model effort
-  local cli="$1" job="$2" wt="$3" model="$4" effort="$5" brief engine
-  brief="$(cat "$job/brief.md")"
+_adapter_build_argv() { # cli jobdir workdir model effort
+  local cli="$1" job="$2" workdir="$3" model="$4" effort="$5" brief engine
+  # Command substitution trims trailing newlines; a sentinel retains them.
+  brief="$(cat "$job/brief.md"; printf x)"; brief="${brief%x}"
   ADAPTER_ARGV=()
   case "$cli" in
     codex)
@@ -51,7 +52,7 @@ _adapter_build_argv() { # cli jobdir worktree model effort
       # --search is a top-level flag (`codex exec --search` is rejected).
       [ "$(jq -r '.kind // empty' "$job/meta.json" 2>/dev/null)" = research ] && ADAPTER_ARGV+=(--search)
       ADAPTER_ARGV+=(exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \
-        -C "$wt" -o "$job/codex.last" --json)
+        -C "$workdir" -o "$job/codex.last" --json)
       [ -n "$model" ] && ADAPTER_ARGV+=(-m "$model")
       [ -n "$effort" ] && ADAPTER_ARGV+=(-c "model_reasoning_effort=$effort")
       ADAPTER_ARGV+=("$brief") ;;
@@ -66,7 +67,7 @@ _adapter_build_argv() { # cli jobdir worktree model effort
       [ -n "$model" ] && ADAPTER_ARGV+=(--model "$model")
       [ -n "$effort" ] && ADAPTER_ARGV+=(--reasoning-effort "$effort") ;;
     cursor)
-      ADAPTER_ARGV=(cursor-agent -p --yolo --trust --output-format stream-json --workspace "$wt")
+      ADAPTER_ARGV=(cursor-agent -p --yolo --trust --output-format stream-json --workspace "$workdir")
       if [ -n "$model" ]; then
         if [ -n "$effort" ]; then ADAPTER_ARGV+=(--model "$model[effort=$effort]")
         else ADAPTER_ARGV+=(--model "$model"); fi
@@ -79,13 +80,13 @@ _adapter_build_argv() { # cli jobdir worktree model effort
 
 # Prints the argv for <cli>, one element per line (inspection/tests only: a
 # brief with embedded newlines will not round-trip through this text form).
-adapter_argv() { # cli jobdir worktree model effort
+adapter_argv() { # cli jobdir workdir model effort
   _adapter_build_argv "$@"
   printf '%s\n' "${ADAPTER_ARGV[@]}"
 }
 
-# Replaces the current process with the worker. cwd is already the worktree.
-adapter_exec() { # cli jobdir worktree model effort
+# Replaces the current process with the worker. cwd is already workdir.
+adapter_exec() { # cli jobdir workdir model effort
   _adapter_build_argv "$@"
   exec "${ADAPTER_ARGV[@]}"
 }

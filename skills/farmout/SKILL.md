@@ -1,6 +1,7 @@
 ---
 name: farmout
-description: Use when a task should run on another coding-agent CLI the user has installed (Codex, Kiro, Copilot, Cursor) while Claude Code stays the orchestrator - when the user says "farm this out", "send this to codex", "have kiro review it", "get a second opinion from copilot", "cross-review this", or when bulk reading, an independent review, or a parallelisable side task would be cheaper off Claude. Covers suggesting a farm-out, writing the brief, launching and monitoring the job, reviewing the result, and landing a worker's diff as uncommitted changes. Keywords: farmout, farm out, delegate, delegation, worker, second opinion, cross review, codex, kiro, copilot, cursor, offload, worktree, land.
+description: >-
+  Use when a task should run on another coding-agent CLI the user has installed (Codex, Kiro, Copilot, Cursor) while Claude Code stays the orchestrator - when the user says "farm this out", "send this to codex", "have kiro review it", "get a second opinion from copilot", "cross-review this", or when bulk reading, an independent review, or a parallelisable side task would be cheaper off Claude. Covers suggesting a farm-out, writing the brief, launching and monitoring the job, reviewing the result, and landing a worker's diff as uncommitted changes. Keywords: farmout, farm out, delegate, delegation, worker, second opinion, cross review, codex, kiro, copilot, cursor, offload, worktree, land.
 ---
 
 # Farmout
@@ -9,8 +10,9 @@ Works with whichever of the four CLIs are installed and logged in -
 `farmout doctor` says which.
 
 Claude Code is the orchestrator. Workers are other agent CLIs run headless,
-fully auto-approved, each inside its own git worktree. Nothing a worker does
-reaches the user's checkout until Claude reviews it and runs `farmout land`.
+fully auto-approved. By default each runs inside its own git worktree; its
+changes reach the user's checkout only after review and `farmout land`.
+Explicit in-place mode instead edits and commits in the live checkout.
 
 Tool: `farmout` (on PATH after `install.sh`; inside the plugin it is `${CLAUDE_PLUGIN_ROOT}/bin/farmout`).
 
@@ -48,7 +50,8 @@ Run `farmout doctor` when a worker fails in a way that smells like auth.
 ## 1. Write the brief
 
 The worker sees nothing of this conversation. Write the brief to a file in the
-scratchpad, never inline in the command. Template:
+scratchpad, never inline in the command. Worktree-mode template (use the
+replacement constraints below for in-place jobs):
 
 ```markdown
 # Task
@@ -69,7 +72,7 @@ scratchpad, never inline in the command. Template:
 "code changes plus a final message: what changed and why, one line per file">
 ```
 
-Never put the source checkout's absolute path in a brief - an auto-approved
+In worktree mode, never put the source checkout's absolute path in a brief - an auto-approved
 worker would edit it directly; `farmout run` refuses such briefs. `farmout`
 also puts ground rules ahead of every brief: stay inside the working copy, and
 if it does not match the brief, report that instead of finding the "right"
@@ -118,16 +121,17 @@ replaces the whole table.
 
 - `--effort` and `--model` override the config for this one job; leave them
   out to use `workers.<cli>.effort` / `.model`.
-- Read-only by default. Add `--write` only when the deliverable is code changes.
+- Read-only by default. Add `--write` for a worktree patch, or explicitly opt
+  into `--in-place --owns ...` for commits in the live checkout.
 - What the worker sees: by default the cwd's repo at HEAD **plus your
   uncommitted edits** on whatever branch is checked out. `--ref <rev>` pins
   exactly that commit (dirty edits ignored); `--repo <path>` picks another
   repo; `--no-repo` (or a `research` job run outside any repo) gets an empty
   scratch repo - read-only, hand files back with `--out`.
 - Always run it with Bash `run_in_background: true`. The first stdout line is the
-  job id; stderr then shows `repo=<name> base=<sha> mode=<read|write>` - check
+  job id; stderr then shows `repo=<name> base=<sha> mode=<read|write|in-place>` - check
   it is the repo the brief is about; the harness re-invokes Claude when the job exits. Several jobs may run
-  at once - each has its own worktree.
+  at once - worktree jobs each have their own worktree.
 - Tell the user the job id and what it is doing, then carry on with other work.
 - Exit 4 means max concurrent jobs (the cap counts every session's jobs).
   Relaunch with `--queue`: it waits for a slot in order, shows as `queued` in
@@ -208,7 +212,7 @@ The final line of `run` is `<id> <status>`:
   relevant tests or analysis inside the job worktree (`jq -r .worktree
   meta.json`) before landing.
 
-## 5. Land or discard
+## 5. Land or discard (worktree mode)
 
 ```bash
 farmout land <id>      # applies diff.patch to the user's checkout as uncommitted changes
@@ -237,17 +241,72 @@ unlanded write jobs, and jobs whose result was never read with
 `farmout result`, unless you add `--all`. `discard` keeps the job record and
 prints the result's first lines. Plain `clean` touches every
 session's jobs - use it only when the user asks. `farmout status` has a LAND
-column (`-`, `landed`, `discarded`, `conflict`) to tell done from pending, and
-SNAPSHOT-OF names the repo the worktree was cut from.
+column (`-`, `landed`, `discarded`, `conflict`, `accepted`) to tell done from pending,
+and REPO names the source repo.
+
+## In-place mode (fix rounds on one branch)
+
+Use this only when every lane belongs on the current branch and the user wants
+worker commits rather than patches. It gives up the worktree copy: edits and
+commits happen immediately in the live checkout. Authorization to farm out a
+review or a patch does not itself authorize switching to this mode.
+
+Partition repo-relative Git pathspecs into mandatory, disjoint `--owns` sets:
+
+```bash
+farmout run auto --kind implement --in-place --owns src/export --owns tests/export --brief export.md
+```
+
+Owned paths must be clean. Detached HEAD and the default branch are refused
+(the latter has an explicit `--allow-default-branch` override). Live lanes in
+the same checkout cannot share tracked files; overlap involving only future
+untracked files cannot be detected, so reserve their names in the briefs too.
+Queued jobs recheck the branch, cleanliness and overlap at admission. The
+per-checkout `limits.in_place_max` cap defaults to 3, in addition to `max_jobs`.
+
+Keep the Task / Context / Constraints / Deliverable brief shape, describe the
+live checkout in Context, and replace the worktree template's no-commit
+constraint with these runtime rules, filling in explicit owned filenames:
+
+```markdown
+# Constraints
+- You own only these paths: <owns...>. Edit nothing else. If the task needs a file outside them, stop and say so in your final message.
+- Commit your own paths by name: `git add -- <paths>` then `git commit -m "<msg>" -- <paths>`. Never `git add -A`, `git add .`, `git add -u` or `git commit -a`.
+- Never `checkout`/`switch` a branch, `stash`, `reset`, `rebase`, `merge`, `pull`, `push`, `commit --amend`, `clean`, or `restore` a path you did not change. Leave other agents' uncommitted changes alone.
+- If git reports that `index.lock` exists, wait a few seconds and retry. Never delete the lock.
+- If this checkout does not match what the brief describes, stop and report that as your first finding.
+- Run only these lane-local tests: <focused commands for owned paths>.
+
+# Deliverable
+Commit the lane and report the commit SHA, changed paths and lane-local test results.
+```
+
+Before `farmout accept <id>`, the controller checks status is `ok`, reads
+`farmout result <id>`, the attributed commit list and every warning
+(`uncommitted`, `outside_owns`, `unattributed`, shared commits), reads each full
+commit diff (`git show <sha>`), and verifies the lane-local test results.
+Attribution is heuristic: judge commits by their touched paths, not their
+lane label. Stored hashes describe the end-of-job snapshot and can change
+after rebase. Missing or shared commits require manual review.
+
+`farmout accept <id>` records that review as `land: accepted`; it changes
+only job metadata and never Git. The commits are already on the branch, so
+`land` and `discard` refuse in-place jobs. Accepted records can be cleaned
+without removing the checkout. Killing a lane leaves partial changes there.
+If rejecting a lane, review its actual commits and manually run
+`git revert <sha...>` when appropriate; coordinate shared commits and uncommitted edits
+first. There is no `farmout revert` in v1. After all lanes are reviewed and
+accepted, the controller runs the full gate once on the combined branch.
 
 ## Dashboard
 
 `farmout arcade` opens Agent Arcade: a local dashboard showing every Claude
-session and farmout job (KILL/LAND/DISCARD per job), plus SETUP for workers,
+session and farmout job (KILL/LAND/DISCARD for worktree jobs, ACCEPT for
+completed in-place jobs), plus SETUP for workers,
 routing, and limits. It runs until Ctrl-C. Stopping the dashboard never
 affects a running job.
 
-## Pre-flight before landing
+## Pre-flight before landing (worktree mode)
 
 - [ ] Status is `ok`, and the final message was read.
 - [ ] The full diff was read, not just the diffstat.

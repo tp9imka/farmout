@@ -76,7 +76,7 @@ cfg_limit() {
   tv="$(_cfg_typed --arg k "$1" ".limits[\$k] | $_CFG_TYPED_FILTER")"
   [ "$tv" = null ] && { echo ""; return 0; }
   t="${tv%% *}"; v="${tv#* }"
-  case "$1" in stall_min) max="$STALL_MIN_MAX" ;; max_jobs) max="$MAX_JOBS_MAX" ;; *) echo "$v"; return 0 ;; esac
+  case "$1" in stall_min) max="$STALL_MIN_MAX" ;; max_jobs|in_place_max) max="$MAX_JOBS_MAX" ;; *) echo "$v"; return 0 ;; esac
   _cfg_int_ok "$t" "$v" 1 "$max" || { warn "invalid limits.$1 '$v' in config; ignoring"; echo ""; return 0; }
   echo "$v"
 }

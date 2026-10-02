@@ -44,7 +44,7 @@ STATE_BEHIND_AFTER_S = 10
 TOKEN_HEADER = "X-Arcade-Token"
 
 JOB_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[a-z]+-[0-9a-f]{4}$")
-_JOB_ACTION_RE = re.compile(r"^/api/jobs/([^/]+)/(kill|land|discard)$")
+_JOB_ACTION_RE = re.compile(r"^/api/jobs/([^/]+)/(kill|land|discard|accept)$")
 _SESSION_END_RE = re.compile(r"^/api/sessions/([^/]+)/end$")
 SESSION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _STATE_KEYS = ("now", "stall_min", "machine", "errors", "hud", "sessions", "jobs", "hof", "behind_s")
