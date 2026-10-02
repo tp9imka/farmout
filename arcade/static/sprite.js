@@ -3,6 +3,8 @@ import { C } from './vm.js';
 
 const CL = ['..............', '...r.r..r.r...', '...rrrrrrrr...', '..kkkkkkkkkk..', '..kwwwwwwwwk..', '..kwwewwewwk..', '..kwwwwwwwwk..', '...kkkkkkkk...', '..kbbbbbbbbk..', '.kkbbbbbbbbkk.', '.k.bbbbbbbb.k.', '...kkkkkkkk...', '...kk....kk...', '..kkk....kkk..'];
 const WK = ['......a.......', '......k.......', '....kkkkkk....', '...kwwwwwwk...', '...kwewwewk...', '...kwwwwwwk...', '....kkkkkk....', '...kbbbbbbk...', '..kkbbbbbbkk..', '..k.bbbbbb.k..', '....kkkkkk....', '....kk..kk....', '....kk..kk....', '...kkk..kkk...'];
+// Multica agent: a robot with an antenna, a visor and side bolts.
+const MC = ['......a.......', '......k.......', '..kkkkkkkkkk..', '.kwwwwwwwwwwk.', 'kkwdeddddedwkk', '.kwwwwwwwwwwk.', '.kwwwkkkkwwwk.', '..kkkkkkkkkk..', '....kbbbbk....', '..kkbbbbbbkk..', '..k.bbbbbb.k..', '....kkkkkk....', '....kk..kk....', '...kkk..kkk...'];
 const GH = ['..............', '....hhhhhh....', '...hhhhhhhh...', '..hhhhhhhhhh..', '..hhwwhhwwhh..', '..hhwdhhwdhh..', '..hhhhhhhhhh..', '..hhhhhhhhhh..', '..hhhhhhhhhh..', '..hhhhhhhhhh..', '..hhhhhhhhhh..', '..h.hh..hh.h..', '..............', '..............'];
 const PAL = { k: C.W, w: C.G8, r: C.R, g: C.G6, y: C.AMB, h: C.G4, d: C.INK };
 
@@ -12,7 +14,7 @@ export function poseGrid(kind, pose, f) {
     if (f % 2) g[11] = '..hh.hh..hh.h.'.split('').map((c, i) => i < 12 ? c : '.');
     return g;
   }
-  const g = (kind === 'claude' ? CL : WK).map(r => r.split(''));
+  const g = (kind === 'claude' ? CL : kind === 'agent' ? MC : WK).map(r => r.split(''));
   const put = (x, y, c) => { if (x >= 0 && x < 14 && y >= 0 && y < 14) g[y][x] = c; };
   const body = { pause: 'y', conflict: 'y', ended: 'g', discarded: 'g', over: f % 2 ? 'g' : 'r' }[pose] || 'r';
   const eyes = [];
@@ -26,7 +28,7 @@ export function poseGrid(kind, pose, f) {
   eyes.forEach(([x, y]) => {
     if (closed) { g[y][x] = 'k'; put(x + 1, y, 'k'); }
     else if (pose === 'think') { g[y][x] = 'w'; put(x, y - 1, 'k'); }
-    else if (pose === 'over') g[y][x] = 'r';
+    else if (pose === 'over' || kind === 'agent') g[y][x] = 'r';
     else g[y][x] = 'k';
   });
   if (pose === 'think') [[11, 2], [12, 1], [13, 0]].slice(0, f % 4).forEach(([x, y]) => put(x, y, 'h'));

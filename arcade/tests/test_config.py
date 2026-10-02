@@ -362,3 +362,38 @@ class ConfigTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MulticaConfigTest(unittest.TestCase):
+    def test_defaults(self):
+        m = config.merge_defaults({})["multica"]
+        self.assertIsNone(m["enabled"])
+        self.assertIsNone(m["profile"])
+        self.assertEqual(["CHECK MY PRS", "CLEANUP & MERGE"], [q["label"] for q in m["quick_actions"]])
+
+    def test_explicit_empty_list_means_no_quick_actions(self):
+        self.assertEqual([], config.merge_defaults({"multica": {"quick_actions": []}})["multica"]["quick_actions"])
+
+    def test_round_trip_keeps_the_section(self):
+        raw = {"multica": {"enabled": True, "profile": "staging", "quick_actions": [
+            {"label": " SWEEP ", "title": "Nightly sweep", "prompt": "sweep", "agents": ["Janitor"]}]}}
+        merged = config.merge_defaults(raw)
+        self.assertEqual([], config.validate(merged))
+        self.assertEqual({"enabled": True, "profile": "staging", "quick_actions": [
+            {"label": "SWEEP", "title": "Nightly sweep", "prompt": "sweep", "agents": ["Janitor"]}]}, merged["multica"])
+
+    def test_invalid_values_dropped_with_warnings(self):
+        raw = {"multica": {"enabled": "yes", "profile": "../x", "quick_actions": [
+            {"label": "", "title": "t"}, {"label": "OK", "title": "fine"}, "nope"]}}
+        warnings = config.raw_warnings(raw)
+        merged = config.merge_defaults(raw)["multica"]
+        self.assertIsNone(merged["enabled"])
+        self.assertIsNone(merged["profile"])
+        self.assertEqual(["OK"], [q["label"] for q in merged["quick_actions"]])
+        self.assertEqual(4, len(warnings), warnings)
+
+    def test_validate_rejects_bad_section(self):
+        errs = config.validate({"multica": {"enabled": 1, "profile": "a b", "quick_actions": [
+            {"label": "x" * 25, "title": "t", "agents": []}]}})
+        self.assertEqual(4, len(errs), errs)
+        self.assertEqual(["multica: must be an object"], config.validate({"multica": []}))

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- The arcade shows Multica agents as AGENT tiles (robot avatars) with the
+  issue they work on, the running tool and a live run feed. Quick actions
+  (`multica.quick_actions`, default CHECK MY PRS and CLEANUP & MERGE) and a
+  free-form task queue work by creating a `todo` issue assigned to the agent;
+  CANCEL RUN stops a run, and the AUTOPILOTS screen fires any autopilot with
+  RUN NOW. It reads the `multica login` profile; the token stays server-side.
+
 - Supervised in-place fix rounds: opt-in `run --in-place --owns <pathspec>`
   edits and commits directly on the current branch, with clean-owned-path,
   default-branch and tracked-file overlap guards, plus `limits.in_place_max`
