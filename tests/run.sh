@@ -41,9 +41,10 @@ run_job() {
 meta() { jq -r ".$2" "$FARMOUT_HOME/jobs/$1/meta.json"; }
 result() { cat "$FARMOUT_HOME/jobs/$1/result.md"; }
 wait_for_meta_pid() { # id
-  local i=0
+  local i=0 pid
   while [ $i -lt 50 ]; do
-    [ "$(meta "$1" pid 2>/dev/null)" != null ] && [ -n "$(meta "$1" pid 2>/dev/null)" ] && return 0
+    pid="$(meta "$1" pid 2>/dev/null)"
+    case "$pid" in ''|*[!0-9]*) ;; *) return 0 ;; esac
     sleep 0.2; i=$((i + 1))
   done
   local diagnostic="" log
@@ -1056,11 +1057,14 @@ test_in_place_overlapping_claims_admit_exactly_one() {
   ( export FARMOUT_TEST_JOB_ID=claim-second
     cd "$REPO" && "$FARMOUT" run fake --in-place --owns a.txt --timeout 60s --brief "$T/brief.md"
   ) > "$T/second-out" 2> "$T/second-err" &
-  local second=$! before_release=false
+  local second=$! before_release=false second_pid
   i=0
   while [ "$i" -lt 100 ]; do
-    if grep -q 'overlapping claimed job' "$T/second-err"; then break; fi
-    if [ -n "$(meta claim-second pid 2>/dev/null)" ] && [ "$(meta claim-second pid 2>/dev/null)" != null ]; then before_release=true; break; fi
+    if grep -q 'overlapping claimed job' "$T/second-err" 2>/dev/null; then break; fi
+    # One read: the claimant's admission retry removes and recreates its job
+    # dir, so two reads can see "null" and then nothing.
+    second_pid="$(meta claim-second pid 2>/dev/null)"
+    case "$second_pid" in ''|*[!0-9]*) ;; *) before_release=true; break ;; esac
     sleep 0.1; i=$((i + 1))
   done
   echo go > "$pause"
