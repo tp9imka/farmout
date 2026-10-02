@@ -33,12 +33,30 @@ DEFAULT_ROUTING = (
     {"kind": "second-opinion", "prefer": "copilot", "fallback": "codex"},
 )
 
+# Arcade-only: the Multica panel. bash never reads this section.
+# Used when the config has no multica.quick_actions key; [] means none.
+DEFAULT_QUICK_ACTIONS = (
+    {"label": "CHECK MY PRS", "title": "Check my open pull requests",
+     "prompt": "Go through my open pull requests. For each one report CI status, review state and "
+               "merge conflicts. Fix small, clearly in-scope problems and push; list anything that "
+               "needs me.", "agents": None},
+    {"label": "CLEANUP & MERGE", "title": "Clean up and merge ready pull requests",
+     "prompt": "Find my pull requests that are approved, green and conflict-free. Merge them, delete "
+               "their branches, and close or update the issues they resolve. Report anything you "
+               "left alone and why.", "agents": None},
+)
+QUICK_LABEL_MAX = 24
+QUICK_TITLE_MAX = 200
+QUICK_PROMPT_MAX = 4000
+QUICK_ACTIONS_MAX = 12
+
 TIMEOUT_MIN_BOUNDS = (1, 240)
 STALL_MIN_BOUNDS = (1, 120)
 MAX_JOBS_BOUNDS = (1, 32)
 IN_PLACE_MAX_BOUNDS = (1, 32)
 
 _MODEL_RE = re.compile(r"^[A-Za-z0-9._:/=\[\]-]+$")
+_PROFILE_RE = re.compile(r"[A-Za-z0-9._-]+")
 _DIGITS_RE = re.compile(r"[0-9]+")
 
 # Serializes the whole check-current-etag-then-write critical section in
@@ -176,6 +194,83 @@ class _Sanitiser(object):
         }
 
 
+def _quick_action_errors(where, qa):
+    if not isinstance(qa, dict):
+        return ["{}: must be an object".format(where)]
+    errors = []
+    for key, limit in (("label", QUICK_LABEL_MAX), ("title", QUICK_TITLE_MAX)):
+        v = qa.get(key)
+        if not isinstance(v, str) or not v.strip() or len(v) > limit:
+            errors.append("{}.{}: must be text of 1..{} characters".format(where, key, limit))
+    prompt = qa.get("prompt")
+    if prompt is not None and (not isinstance(prompt, str) or len(prompt) > QUICK_PROMPT_MAX):
+        errors.append("{}.prompt: must be text of at most {} characters".format(where, QUICK_PROMPT_MAX))
+    agents = qa.get("agents")
+    if agents is not None and not (isinstance(agents, list) and agents
+                                   and all(isinstance(a, str) and a.strip() for a in agents)):
+        errors.append("{}.agents: must be null or a list of agent names".format(where))
+    return errors
+
+
+def _multica_errors(m):
+    if not isinstance(m, dict):
+        return ["multica: must be an object"]
+    errors = []
+    enabled = m.get("enabled")
+    if enabled is not None and not isinstance(enabled, bool):
+        errors.append("multica.enabled: must be true, false or null")
+    profile = m.get("profile")
+    if profile is not None and not (isinstance(profile, str) and _PROFILE_RE.fullmatch(profile)):
+        errors.append("multica.profile: must be a profile name or null")
+    qas = m.get("quick_actions")
+    if isinstance(qas, list):
+        if len(qas) > QUICK_ACTIONS_MAX:
+            errors.append("multica.quick_actions: at most {}".format(QUICK_ACTIONS_MAX))
+        for i, qa in enumerate(qas):
+            errors.extend(_quick_action_errors("multica.quick_actions[{}]".format(i), qa))
+    elif qas is not None:
+        errors.append("multica.quick_actions: must be a list")
+    return errors
+
+
+def _clean_quick_action(qa):
+    agents = qa.get("agents")
+    return {"label": qa["label"].strip(), "title": qa["title"].strip(), "prompt": qa.get("prompt") or "",
+            "agents": [a.strip() for a in agents] if agents else None}
+
+
+def _sanitise_multica(san, m):
+    if m is None:
+        m = {}
+    elif not isinstance(m, dict):
+        san.drop("multica", m, "an object")
+        m = {}
+    enabled = m.get("enabled")
+    if enabled is not None and not isinstance(enabled, bool):
+        san.drop("multica.enabled", enabled, "true, false or null")
+        enabled = None
+    profile = m.get("profile")
+    if profile is not None and not (isinstance(profile, str) and _PROFILE_RE.fullmatch(profile)):
+        san.drop("multica.profile", profile, "a profile name")
+        profile = None
+    qas = m.get("quick_actions")
+    if qas is None:
+        kept = [dict(q) for q in DEFAULT_QUICK_ACTIONS]
+    elif not isinstance(qas, list):
+        san.drop("multica.quick_actions", qas, "a list")
+        kept = [dict(q) for q in DEFAULT_QUICK_ACTIONS]
+    else:
+        kept = []
+        for i, qa in enumerate(qas[:QUICK_ACTIONS_MAX]):
+            if _quick_action_errors("", qa):
+                san.drop("multica.quick_actions[{}]".format(i), qa, "a label, title, prompt and agents")
+                continue
+            kept.append(_clean_quick_action(qa))
+        if len(qas) > QUICK_ACTIONS_MAX:
+            san.warnings.append("multica.quick_actions: only the first {} kept".format(QUICK_ACTIONS_MAX))
+    return {"enabled": enabled, "profile": profile, "quick_actions": kept}
+
+
 def _sanitise(raw):
     raw = raw if isinstance(raw, dict) else {}
     san = _Sanitiser()
@@ -200,6 +295,7 @@ def _sanitise(raw):
         "workers": workers,
         "routing": san.routing(raw.get("routing")),
         "limits": san.limits(raw.get("limits")),
+        "multica": _sanitise_multica(san, raw.get("multica")),
     }
     return cfg, san.warnings
 
@@ -315,6 +411,9 @@ def validate(cfg):
         errors.extend(_validate_limits(limits))
     elif limits is not None:
         errors.append("limits: must be an object")
+
+    if cfg.get("multica") is not None:
+        errors.extend(_multica_errors(cfg["multica"]))
 
     return errors
 

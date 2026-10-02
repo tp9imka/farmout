@@ -2,9 +2,11 @@ import { html, render, Component } from './vendor/htm-preact-standalone.mjs';
 import {
   C, clock, rows, hud, benchOps, hofVM, tileVM, findRecord, focusJobVM, focusSessionVM, confirmVM,
   configDraftOps, setupVM, isDirty, TIMEOUT_STEP, actionMsgVM,
+  focusAgentVM, autopilotsVM, mcStatusVM, mcState,
 } from './vm.js';
 import { Cabinet } from './cabinet.js';
-import { FocusJob, FocusSession } from './focus.js';
+import { FocusJob, FocusSession, FocusAgent } from './focus.js';
+import { Autopilots } from './ops.js';
 import { Setup } from './setup.js';
 import { Confirm } from './modal.js';
 
@@ -20,6 +22,8 @@ const TABS = ['workers', 'routing', 'limits', 'machine'];
 const BENCH_KEY = 'arcade.bench';
 const loadBench = () => { try { const b = JSON.parse(localStorage.getItem(BENCH_KEY)); return b && typeof b === 'object' ? b : {}; } catch (e) { return {}; } };
 const saveBench = b => { try { localStorage.setItem(BENCH_KEY, JSON.stringify(b)); } catch (e) { /* per-viewer convenience only */ } };
+const TOAST_MS = 6000;
+const EMPTY_FORM = { title: '', prompt: '' };
 const SND = { toggle: [[880, 1320], 0.06], save: [[660, 990], 0.07], win: [[523, 659, 784, 1047], 0.09], lose: [[392, 330, 262], 0.14] };
 
 // Resolves {r, body}; the timeout also covers reading the body, and rejects on expiry.
@@ -53,6 +57,7 @@ class App extends Component {
       confirm: null, busy: false, actionMsg: null, saving: false,
       saved: null, draft: null, etag: null, cfgStale: false, cfgErr: null, tab: 'workers', savedNote: 'ALL CHANGES SAVED',
       doctor: null, checking: false, lastCheck: null, view: 'play', bench: loadBench(),
+      form: EMPTY_FORM, toast: null,
     };
   }
 
@@ -85,7 +90,7 @@ class App extends Component {
 
   componentWillUnmount() {
     this.dead = true;
-    clearInterval(this.frameT); clearTimeout(this.pollT);
+    clearInterval(this.frameT); clearTimeout(this.pollT); clearTimeout(this.toastT);
     window.removeEventListener('keydown', this.onKey); window.removeEventListener('resize', this.onResize);
   }
 
@@ -108,7 +113,48 @@ class App extends Component {
 
   nav(d) { this.setState(s => ({ page: s.page + d })); }
   home() { this.setState({ screen: 'cabinet', focusId: null, confirm: null }); }
-  open(id) { this.setState({ screen: 'focus', focusId: id, actionMsg: null }); }
+  open(id) { this.setState(s => ({ screen: 'focus', focusId: id, actionMsg: null, ...(s.focusId === id ? {} : { form: EMPTY_FORM }) })); }
+  openAutopilots() { this.setState({ screen: 'autopilots', focusId: null, confirm: null, actionMsg: null }); }
+
+  showToast(msg, ok) {
+    clearTimeout(this.toastT);
+    this.setState({ toast: { msg, ok } });
+    this.toastT = setTimeout(() => this.setState({ toast: null }), TOAST_MS);
+  }
+
+  askQuick(id, i) {
+    const qa = ((mcState(this.state.data) || {}).quick_actions || []).find(q => q.i === i);
+    if (qa && !this.state.busy) this.setState({ confirm: { type: 'mc-quick', id, extra: { quick: i, title: qa.title, prompt: qa.prompt } } });
+  }
+
+  // POST path and JSON body for a Multica action.
+  mcRequest(type, id, extra) {
+    const e = encodeURIComponent;
+    if (type === 'mc-cancel') return [`/api/multica/tasks/${e(extra.task)}/cancel`, {}];
+    if (type === 'mc-trigger') return [`/api/multica/autopilots/${e(id)}/trigger`, {}];
+    if (type === 'mc-quick') return [`/api/multica/agents/${e(id)}/queue`, { quick: extra.quick }];
+    return [`/api/multica/agents/${e(id)}/queue`, { title: extra.title, prompt: extra.prompt || '' }];
+  }
+
+  async actMulti(type, id, extra) {
+    let msg = null, ok = false;
+    try {
+      const [path, payload] = this.mcRequest(type, id, extra);
+      const { r, body } = await api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }, ACTION_TIMEOUT_MS);
+      msg = actionMsgVM(type, r.status, body);
+      ok = msg === null;
+      if (ok) {
+        const issue = body && body.issue;
+        msg = type === 'mc-cancel' ? 'RUN CANCELLED' : type === 'mc-trigger' ? `AUTOPILOT FIRED · ${String(body.status || 'STARTED').toUpperCase()}`
+          : `QUEUED · ${issue && (issue.identifier || issue.title) ? (issue.identifier || issue.title) : 'NEW ISSUE'}`;
+      }
+    } catch (e) {
+      msg = `${type === 'mc-cancel' ? 'CANCEL' : type === 'mc-trigger' ? 'RUN NOW' : 'QUEUE'} FAILED · ${errText(e)}`;
+    }
+    this.setState(s => ({ busy: false, actionMsg: msg, ...(ok && type === 'mc-queue' ? { form: EMPTY_FORM } : {}) }));
+    this.showToast(msg, ok);
+    this.beep(ok ? SND.win : SND.lose);
+  }
 
   beep([seq, dur]) {
     if (!this.state.sound) return;
@@ -123,8 +169,9 @@ class App extends Component {
   async act() {
     const { confirm, busy } = this.state;
     if (!confirm || busy) { this.setState({ confirm: null }); return; }
-    const { type, id } = confirm;
+    const { type, id, extra } = confirm;
     this.setState({ confirm: null, busy: true, actionMsg: null });
+    if (type.startsWith('mc-')) { await this.actMulti(type, id, extra || {}); return; }
     let msg = null, won = false;
     try {
       const path = type === 'end' ? `/api/sessions/${encodeURIComponent(id)}/end` : `/api/jobs/${encodeURIComponent(id)}/${type}`;
@@ -213,7 +260,10 @@ class App extends Component {
     const hudv = hud(data);
     const found = S.screen === 'focus' ? findRecord(S.data, S.focusId) : null;
     const screen = S.screen === 'focus' && !found ? 'cabinet' : S.screen;
-    const screenLabel = screen === 'setup' ? 'OPERATOR MENU' : screen === 'focus' ? (found.kind === 'claude' ? 'FOCUS · SESSION' : 'FOCUS · JOB') : 'CABINET';
+    const mc = mcState(S.data);
+    const mcOn = !!(mc && mc.enabled);
+    const screenLabel = screen === 'setup' ? 'OPERATOR MENU' : screen === 'autopilots' ? 'AUTOPILOTS'
+      : screen === 'focus' ? ({ claude: 'FOCUS · SESSION', agent: 'FOCUS · AGENT' }[found.kind] || 'FOCUS · JOB') : 'CABINET';
     const hdrBtn = 'font-family:\'Press Start 2P\',monospace; font-size:9px; padding:8px 10px; border:2px solid var(--color-bg); cursor:pointer;';
 
     let body = null;
@@ -237,8 +287,24 @@ class App extends Component {
         pageDots: Array.from({ length: r.nPages }, (_, i) => (i === r.page ? C.R : C.G6)),
         pageLabel: `PAGE ${r.page + 1}/${r.nPages}`, pagerOp: r.nPages > 1 ? '1' : '0.3',
         onGo: i => { this.setState({ page: i }); }, onNav: d => this.nav(d), onOpen: id => this.open(id),
+        onQuick: (id, i) => this.askQuick(id, i), mc: mcStatusVM(data),
         hof: hofVM(data), noSignalMsg: `Can't reach /api/state${S.lastErr ? ` (${S.lastErr})` : ''}`,
         retry: Math.ceil(POLL_MS / 1000), staticAngle: (S.f * 37 % 180) + 'deg',
+      }} />`;
+    } else if (screen === 'focus' && found.kind === 'agent') {
+      body = html`<${FocusAgent} fa=${focusAgentVM(found.rec, S.data, S.f, blink)} onBack=${() => this.home()} busy=${S.busy}
+        actionMsg=${S.busy ? 'WORKING…' : S.actionMsg} form=${S.form} onForm=${patch => this.setState(s => ({ form: { ...s.form, ...patch } }))}
+        onAsk=${(type, extra) => { if (!this.state.busy) this.setState({ confirm: { type, id: found.rec.id, extra } }); }} />`;
+    } else if (screen === 'autopilots') {
+      const ws = mc && mc.workspace;
+      body = html`<${Autopilots} v=${{
+        rows: autopilotsVM(S.data), busy: S.busy, actionMsg: S.busy ? 'WORKING…' : S.actionMsg, back: () => this.home(),
+        subtitle: mcOn ? `${(ws && (ws.name || ws.slug) || 'MULTICA').toUpperCase()}${mc.connected ? '' : ' · OFFLINE'}` : 'MULTICA IS OFF',
+        appUrl: mc && mc.app_url && ws && ws.slug ? `${mc.app_url}/${encodeURIComponent(ws.slug)}/autopilots` : null,
+        emptyText: !mcOn ? 'Multica is not connected. Run multica login, or set multica.enabled in the farmout config.'
+          : mc.connected ? 'No autopilots in this workspace yet. Create one in Multica; it shows up here with a RUN NOW button.'
+            : `Can't reach Multica: ${mc.error || mc.why || 'unknown error'}`,
+        onRun: id => { if (!this.state.busy) this.setState({ confirm: { type: 'mc-trigger', id } }); },
       }} />`;
     } else if (screen === 'focus' && found.kind === 'worker') {
       body = html`<${FocusJob} fw=${focusJobVM(found.rec, S.f, blink)} onBack=${() => this.home()} busy=${S.busy} actionMsg=${S.busy ? 'WORKING…' : S.actionMsg}
@@ -264,8 +330,10 @@ class App extends Component {
       }} />`;
     }
 
-    const rec = S.confirm && findRecord(S.data, S.confirm.id);
-    const cf = rec ? confirmVM(S.confirm.type, rec.rec) : null;
+    const rec = !S.confirm ? null : S.confirm.type === 'mc-trigger'
+      ? (() => { const a = ((mc && mc.autopilots) || []).find(x => x.id === S.confirm.id); return a ? { rec: a } : null; })()
+      : findRecord(S.data, S.confirm.id);
+    const cf = rec ? confirmVM(S.confirm.type, rec.rec, S.confirm.extra) : null;
 
     return html`
       <div data-screen-label="Farmout Arcade" style="position:relative; width:100%; min-width:1440px; height:100vh; min-height:900px; display:flex; flex-direction:column; background:#0e0d0d; color:var(--color-bg); font-family:var(--font-body); overflow:hidden;">
@@ -277,11 +345,14 @@ class App extends Component {
           <div style="display:flex; flex-direction:column; gap:7px; font-family:'Press Start 2P',monospace; font-size:8px;">IN PLAY<span style="font-size:14px;">${hudv.inPlay}</span></div>
           <div style="display:flex; flex-direction:column; gap:7px; font-family:'Press Start 2P',monospace; font-size:8px;">COINS<span style="font-size:14px;">${hudv.coins}</span></div>
           <div style="display:flex; gap:8px;">
+            ${mcOn && html`<div class="h-acc6" onClick=${() => this.openAutopilots()} style=${hdrBtn}>AUTOPILOTS</div>`}
             <div class="h-acc6" onClick=${() => this.openSetup()} style=${hdrBtn}>SETUP</div>
             <div class="h-acc6" onClick=${() => { const on = !S.sound; this.setState({ sound: on }, () => { if (on) this.beep(SND.toggle); }); }} style=${hdrBtn}>${S.sound ? 'SND ON' : 'SND OFF'}</div>
           </div>
         </div>
         ${body}
+        ${screen === 'cabinet' && S.toast && html`
+          <div style="position:absolute; right:22px; bottom:250px; max-width:520px; padding:12px 14px; background:#0e0d0d; border:2px solid ${S.toast.ok ? '#f0a830' : 'var(--color-accent)'}; font-family:'Press Start 2P',monospace; font-size:9px; line-height:1.6; color:${S.toast.ok ? '#f0a830' : 'var(--color-accent)'};">${S.toast.msg}</div>`}
         ${cf && html`<${Confirm} cf=${cf} onYes=${() => this.act()} onNo=${() => this.setState({ confirm: null })} />`}
       </div>`;
   }

@@ -14,6 +14,9 @@ export const DEFAULT_TIMEOUT_MIN = 30;
 export const BOUNDS = { timeout_min: [1, 240], stall_min: [1, 120], max_jobs: [1, 32], in_place_max: [1, 32] };
 
 const SESSION_STAGES = ['play', 'think', 'turn', 'idle'];
+// Multica agent status -> design stage (and sprite pose).
+const AGENT_STAGE = { working: 'play', queued: 'queued', idle: 'idle', offline: 'lost', unbound: 'lost' };
+const AGENT_POSE = { play: 'play', queued: 'think', idle: 'idle', lost: 'lost' };
 const HEALTH = { ok: 'OK', 'not-verified': 'NOT VERIFIED', 'logged-out': 'LOGGED OUT', missing: 'MISSING' };
 const HEALTH_STYLE = {
   OK: [C.W, C.INK, C.W, 'solid'], 'NOT VERIFIED': ['transparent', C.AMB, C.AMB, 'solid'],
@@ -49,6 +52,7 @@ const tokensOf = (rec, kind) => kind === 'claude' ? rec.score : rec.tokens;
 // Design "status" per record: session play/think/turn/idle/raw, job play/pause/lost/clear/over.
 export function stageOf(kind, rec) {
   if (kind === 'claude') return SESSION_STAGES.includes(rec.status) ? rec.status : 'raw';
+  if (kind === 'agent') return AGENT_STAGE[rec.status] || 'idle';
   const p = rec.pose;
   if (p === 'play' || p === 'pause' || p === 'lost' || p === 'over' || p === 'queued') return p;
   return 'clear';
@@ -56,6 +60,7 @@ export function stageOf(kind, rec) {
 
 export function spritePose(kind, rec) {
   if (kind === 'claude') { const st = stageOf(kind, rec); return st === 'raw' ? 'idle' : st; }
+  if (kind === 'agent') return AGENT_POSE[stageOf(kind, rec)];
   if (rec.pose === 'queued') return 'idle';
   return ['ready', 'landed', 'review', 'accepted'].includes(rec.pose) ? 'clear' : rec.pose;
 }
@@ -70,6 +75,14 @@ export function tagFor(kind, rec, blink) {
       think: T('THINK', C.R, C.W, C.R), play: T('PLAY', C.R, C.W, C.R), turn: T('YOUR TURN', C.R, C.W, C.R, true),
       idle: T('IDLE', 'transparent', C.G4, C.G4),
     }[st] || T(up(rec.status), 'transparent', C.G4, C.G4);
+  }
+  if (kind === 'agent') {
+    const nq = list(rec.queue).length;
+    if (st === 'play') return T(nq ? `WORKING · +${nq}` : 'WORKING', C.R, C.W, C.R);
+    if (st === 'queued') return T(`QUEUED · ${nq}`, 'transparent', C.AMB, C.AMB, true, 'dashed');
+    if (st === 'lost') return T(up(rec.status), 'transparent', C.G4, C.G4, false, 'dashed');
+    const last = rec.last && rec.last.status;
+    return last === 'failed' ? T('IDLE · LAST FAILED', 'transparent', C.R, C.R) : T('IDLE', 'transparent', C.G4, C.G4);
   }
   if (st === 'play') return T('PLAY', C.R, C.W, C.R);
   if (st === 'pause') return T('PAUSE', C.AMB, C.INK, C.AMB, true);
@@ -103,6 +116,7 @@ const itemsStr = (rec, kind) => {
 };
 
 export function tileVM(rec, kind, f, opts = {}) {
+  if (kind === 'agent') return agentTileVM(rec, f, opts);
   const blink = opts.blink || '1';
   const isC = kind === 'claude';
   const st = stageOf(kind, rec);
@@ -132,6 +146,117 @@ export function tileVM(rec, kind, f, opts = {}) {
     clearOv: !isC && st === 'clear', overOv: !isC && st === 'over', reason: isC ? null : overReason(rec),
     pose: spritePose(kind, rec), f: f + seedOf(rec.id),
   };
+}
+
+// ---- Multica agents ------------------------------------------------------
+
+export const mcState = state => (state && state.multica) || null;
+export const mcAgents = state => { const m = mcState(state); return m && m.enabled ? list(m.agents) : []; };
+const issueStr = issue => {
+  if (!issue) return DASH;
+  const id = issue.identifier || '', t = issue.title || '';
+  return id && t ? `${id} · ${t}` : (id || t || DASH);
+};
+
+// Configured quick actions this agent may run (agents: null = every agent).
+export function quickFor(rec, state) {
+  const m = mcState(state);
+  const name = String(rec.name || '').toLowerCase();
+  return list(m && m.quick_actions).filter(q => !q.agents || list(q.agents).some(a => String(a).toLowerCase() === name));
+}
+
+function agentTileVM(rec, f, opts = {}) {
+  const blink = opts.blink || '1';
+  const st = stageOf('agent', rec);
+  const task = rec.task;
+  const nq = list(rec.queue).length;
+  const replay = list(rec.replay);
+  const last = replay[replay.length - 1];
+  const where = [rec.provider, rec.runtime && rec.runtime.name].filter(Boolean).map(up).join(' · ');
+  return {
+    real: true, id: rec.id, statusKey: dash(rec.status) + ':' + (task ? task.id : ''), kind: 'agent',
+    name: up(rec.name), isClaude: false, isWorker: false, isAgent: true, isTurn: false,
+    badge: 'AGENT', badgeBg: 'transparent', badgeBd: C.AMB,
+    sub: where ? `MULTICA · ${where}` : 'MULTICA',
+    repo: DASH, branch: task ? dash(task.branch) : DASH,
+    model: rec.model || 'DEFAULT',
+    tool: rec.tool ? rec.tool : st === 'queued' ? 'WAITING FOR RUNTIME' : st === 'lost' ? up(rec.status) : DASH,
+    score: '',
+    mission: task ? issueStr(task.issue) : nq ? issueStr(rec.queue[0].issue) : rec.last ? `LAST · ${issueStr(rec.last.issue)}` : 'NO TASK',
+    lastMsg: last ? dash(last.m) : rec.last && rec.last.error ? `ERROR · ${rec.last.error}` : DASH,
+    timeStr: task ? fmtT(task.elapsed_s) : DASH, coins: '', items: nq ? `${nq} QUEUED` : '',
+    bar: [], barVal: '',
+    queue: Array.from({ length: Math.min(nq, 8) }, () => ({ c: C.AMB })), queueVal: `${nq} QUEUED`,
+    quick: quickFor(rec, opts.state).slice(0, 3).map(q => ({ i: q.i, label: q.label })),
+    crew: [], crewVal: '',
+    tag: tagFor('agent', rec, blink),
+    bStyle: st === 'lost' ? 'dashed' : 'solid',
+    bColor: st === 'lost' ? C.G4 : st === 'play' ? C.AMB : '#444141',
+    topBar: st === 'play' ? C.AMB : 'transparent',
+    dim: st === 'idle' ? '0.8' : st === 'lost' ? '0.6' : '1',
+    clearOv: false, overOv: false, reason: null,
+    pose: spritePose('agent', rec), f: f + seedOf(rec.id),
+  };
+}
+
+const taskRowVM = (t, base) => ({
+  id: t.id, issue: issueStr(t.issue), status: up(t.status), time: fmtT(t.elapsed_s),
+  url: base && t.issue && t.issue.id ? base + t.issue.id : null,
+});
+
+export function focusAgentVM(rec, state, f, blink) {
+  const o = agentTileVM(rec, f, { blink, state });
+  const task = rec.task, base = rec.issue_base || null;
+  o.replay = replayVM(rec.replay);
+  o.mission = task ? issueStr(task.issue) : 'NO TASK RUNNING';
+  o.missionUrl = task && base && task.issue && task.issue.id ? base + task.issue.id : null;
+  o.description = rec.description ? String(rec.description) : null;
+  o.url = rec.url || null;
+  o.queueList = list(rec.queue).map(t => taskRowVM(t, base));
+  o.lastRow = rec.last ? taskRowVM(rec.last, base) : null;
+  o.lastError = rec.last && rec.last.error ? String(rec.last.error) : null;
+  o.meta = [
+    { k: 'PROVIDER', v: up(rec.provider) }, { k: 'MODEL', v: rec.model || 'DEFAULT' },
+    { k: 'RUNTIME', v: dash(rec.runtime && rec.runtime.name) }, { k: 'RUNTIME STATUS', v: up(rec.runtime && rec.runtime.status) },
+    { k: 'RUN', v: task ? up(task.status) : DASH }, { k: 'ELAPSED', v: task ? fmtT(task.elapsed_s) : DASH },
+    { k: 'ATTEMPT', v: task && isNum(task.attempt) ? `${task.attempt}/${dash(task.max_attempts)}` : DASH },
+    { k: 'MAX PARALLEL', v: dash(rec.max_concurrent) },
+    { k: 'BRANCH', v: task ? dash(task.branch) : DASH, span: '1 / -1' },
+    { k: 'WORK DIR', v: task ? dash(task.work_dir) : DASH, span: '1 / -1' },
+  ].map(m => ({ span: 'auto', ...m }));
+  o.quickAll = quickFor(rec, state).map(q => ({ i: q.i, label: q.label, title: q.title }));
+  o.canCancel = !!task;
+  o.cancelId = task ? task.id : null;
+  return o;
+}
+
+export function autopilotsVM(state) {
+  return list(mcState(state) && mcState(state).autopilots).map(a => ({
+    id: a.id, title: dash(a.title), desc: a.description ? String(a.description) : '',
+    agent: a.agent ? up(a.agent) : a.assignee_type ? up(a.assignee_type) : DASH,
+    triggers: list(a.triggers).map(up).join(' · ') || 'MANUAL',
+    mode: up(a.mode), next: a.next_run ? when(a.next_run, state && state.now) : DASH,
+    last: a.last_run ? when(a.last_run, state && state.now) : 'NEVER',
+    active: a.status === 'active',
+    tag: a.status === 'active' ? { label: 'ACTIVE', bg: C.W, fg: C.INK, bd: C.W, bs: 'solid', op: '1' }
+      : { label: up(a.status), bg: 'transparent', fg: C.G4, bd: C.G4, bs: 'dashed', op: '1' },
+  }));
+}
+
+// "14:05:00" today, else "OCT 03 09:00".
+function when(ms, nowMs) {
+  const d = new Date(ms), n = new Date(isNum(nowMs) ? nowMs : Date.now());
+  if (d.toDateString() === n.toDateString()) return clock(ms);
+  const mon = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'][d.getMonth()];
+  return `${mon} ${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+export function mcStatusVM(state) {
+  const m = mcState(state);
+  if (!m || !m.enabled) return null;
+  const ws = m.workspace && (m.workspace.name || m.workspace.slug);
+  if (m.connected) return { label: `MULTICA · ${up(ws || 'CONNECTED')}`, color: C.W, title: m.server || '' };
+  return { label: 'MULTICA · OFFLINE', color: C.AMB, title: m.error || m.why || '' };
 }
 
 // land applies to whatever the repo has checked out now, not to source_branch.
@@ -214,7 +339,21 @@ export function focusSessionVM(rec, state, f, blink) {
   return o;
 }
 
-export function confirmVM(type, rec) {
+export function confirmVM(type, rec, extra = {}) {
+  if (type === 'mc-cancel') {
+    return { title: 'CANCEL RUN?', body: `Stops ${up(rec.name)}'s run on ${issueStr(rec.task && rec.task.issue)} in Multica. The issue stays open.`, yes: 'CANCEL RUN', hasFiles: false, files: [] };
+  }
+  if (type === 'mc-quick' || type === 'mc-queue') {
+    const title = dash(extra.title), prompt = extra.prompt ? String(extra.prompt) : '';
+    return {
+      title: 'QUEUE TASK?', yes: 'QUEUE',
+      body: `Creates the Multica issue “${title}” assigned to ${up(rec.name)}. Its run starts when ${up(rec.name)}'s runtime picks it up.${prompt ? ' Brief: ' + prompt : ''}`,
+      hasFiles: false, files: [],
+    };
+  }
+  if (type === 'mc-trigger') {
+    return { title: 'RUN AUTOPILOT NOW?', body: `Fires “${dash(rec.title)}” once${rec.agent ? ` for ${up(rec.agent)}` : ''}, outside its schedule.`, yes: 'RUN NOW', hasFiles: false, files: [] };
+  }
   const cli = up(rec.cli), id = dash(rec.id), files = filesVM(rec.files), n = dash(fileCount(rec));
   const killNote = rec.mode === 'in-place' ? ` Partial changes stay uncommitted in ${dash(rec.repo)}'s checkout.`
     : rec.mode === 'write' ? ' Partial changes stay in its worktree.' : '';
@@ -227,12 +366,14 @@ export function confirmVM(type, rec) {
   }[type];
 }
 
+const ACTION_NAMES = { 'mc-cancel': 'CANCEL', 'mc-quick': 'QUEUE', 'mc-queue': 'QUEUE', 'mc-trigger': 'RUN NOW' };
+
 // The action result line, or null on success. A null exit code means the
 // server never got one (spawn failure or timeout), not an HTTP-level failure.
 export function actionMsgVM(type, httpStatus, body) {
-  const T = type.toUpperCase();
+  const T = ACTION_NAMES[type] || type.toUpperCase();
   if (body && body.conflict) return 'CONFLICT · PATCH DOES NOT APPLY';
-  if (httpStatus === 409) return type === 'end' ? 'SESSION IS NOT SUSPENDED ANYMORE' : 'ANOTHER ACTION IS RUNNING ON THIS JOB';
+  if (httpStatus === 409) return type === 'end' ? 'SESSION IS NOT SUSPENDED ANYMORE' : type.startsWith('mc-') ? 'ANOTHER ACTION IS RUNNING' : 'ANOTHER ACTION IS RUNNING ON THIS JOB';
   const detail = body && (body.err || body.error) ? String(body.err || body.error).trim() : '';
   const tail = detail ? ` · ${detail}` : '';
   if (httpStatus < 200 || httpStatus >= 300) return `${T} FAILED (HTTP ${httpStatus})${tail}`;
@@ -244,7 +385,8 @@ export function actionMsgVM(type, httpStatus, body) {
 }
 
 // Idle, suspended and ended sessions sit on the bench unless returned by hand.
-export const autoBenched = (kind, rec) => kind === 'claude' && ['idle', 'raw'].includes(stageOf(kind, rec));
+export const autoBenched = (kind, rec) => (kind === 'claude' && ['idle', 'raw'].includes(stageOf(kind, rec)))
+  || (kind === 'agent' && ['idle', 'lost'].includes(stageOf(kind, rec)));
 export function isBenched(kind, rec, bench) {
   const b = bench || {};
   if ((b.benched || []).includes(rec.id)) return true;
@@ -262,14 +404,15 @@ export const benchOps = {
 // view 'play' | 'bench' filters by isBenched; counts cover both views.
 export function rows(state, rowsPerPage, page, view = 'play', bench = null) {
   const every = ((state && state.sessions) || []).map(rec => ({ kind: 'claude', rec }))
-    .concat(((state && state.jobs) || []).map(rec => ({ kind: 'worker', rec })));
+    .concat(((state && state.jobs) || []).map(rec => ({ kind: 'worker', rec })))
+    .concat(mcAgents(state).map(rec => ({ kind: 'agent', rec })));
   const onBench = every.filter(r => isBenched(r.kind, r.rec, bench));
   const recs = view === 'bench' ? onBench : every.filter(r => !onBench.includes(r));
   const ctrl = recs.filter(r => r.kind === 'claude');
   const repoRank = repo => { const i = ctrl.findIndex(r => r.rec.repo === repo); return i < 0 ? ctrl.length : i; };
   const players = recs.filter(r => r.kind === 'worker')
     .map((r, i) => ({ r, i })).sort((a, b) => repoRank(a.r.rec.repo) - repoRank(b.r.rec.repo) || a.i - b.i).map(x => x.r);
-  const ordered = ctrl.concat(players);
+  const ordered = ctrl.concat(players, recs.filter(r => r.kind === 'agent'));
   const all = [];
   for (let i = 0; i < ordered.length; i += TILES_PER_ROW) {
     const tiles = ordered.slice(i, i + TILES_PER_ROW).map(r => ({ real: true, ...r }));
@@ -305,7 +448,9 @@ export function findRecord(state, id) {
   const s = (state.sessions || []).find(x => x.id === id);
   if (s) return { kind: 'claude', rec: s };
   const j = (state.jobs || []).concat(state.hof || []).find(x => x.id === id);
-  return j ? { kind: 'worker', rec: j } : null;
+  if (j) return { kind: 'worker', rec: j };
+  const a = mcAgents(state).find(x => x.id === id);
+  return a ? { kind: 'agent', rec: a } : null;
 }
 
 // SETUP draft: operations on the server's config shape, each returning a new object.

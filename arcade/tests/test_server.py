@@ -18,6 +18,12 @@ import server
 
 FAKE_FARMOUT = os.path.join(os.path.dirname(__file__), "fake-farmout")
 
+# No test may see this machine's real Multica login: an empty profile dir
+# and no MULTICA_* env leave the Multica source disabled unless a test sets one.
+for _k in [k for k in os.environ if k.startswith("MULTICA_")]:
+    del os.environ[_k]
+os.environ["MULTICA_CONFIG_DIR"] = os.path.join(tempfile.gettempdir(), "arcade-tests-no-multica")
+
 UI_STATIC_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "static"))
 UI_INDEX_HTML = os.path.join(UI_STATIC_DIR, "index.html")
 
@@ -490,7 +496,7 @@ class StateSchemaTestCase(_ServerTestCase):
         self.assertEqual(200, resp.status)
         self.assertEqual(
             set(data.keys()),
-            {"now", "stall_min", "machine", "errors", "hud", "sessions", "jobs", "hof", "behind_s"},
+            {"now", "stall_min", "machine", "errors", "hud", "sessions", "jobs", "hof", "multica", "behind_s"},
         )
         self.assertEqual(0, data["behind_s"])
         self.assertEqual(set(data["hud"].keys()), {"score", "live", "shown", "credits", "premium"})

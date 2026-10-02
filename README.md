@@ -9,7 +9,7 @@
 - **Cross-review for real.** Have Codex review what Claude wrote, and Copilot give a second opinion on Codex's review. The workers are different models trained by different companies, so their blind spots differ too.
 - **Isolated by default.** Unless you opt into `--in-place`, each job gets its own worktree, cut from a snapshot of your repo. Nothing touches your checkout until you `land` it, and then only as uncommitted changes.
 - **Watched, not hoped for.** Jobs run in the background. farmout detects a stalled job by the absence of real agent events, so a login spinner that keeps writing to the log still counts as a stall. It also recovers partial output from a killed job.
-- **An arcade for your agents.** `farmout arcade` opens a local dashboard. Every Claude session and every farmed-out job appears as a player, with KILL / LAND / DISCARD or in-place ACCEPT buttons and a Hall of Fame.
+- **An arcade for your agents.** `farmout arcade` opens a local dashboard. Every Claude session and every farmed-out job appears as a player, with KILL / LAND / DISCARD or in-place ACCEPT buttons and a Hall of Fame. [Multica](https://github.com/multica-ai/multica) agents join too, with quick actions that queue work and RUN NOW for autopilots.
 - **Plain bash, jq and Python's standard library.** No daemon, no pip packages, no npm install.
 
 ```
@@ -130,6 +130,18 @@ full gate after all lanes are accepted.
 
 Try it without running anything: `farmout arcade --demo`.
 
+### Multica agents
+
+If you run [Multica](https://github.com/multica-ai/multica) (cloud or self-hosted), the arcade shows its agents next to your sessions and jobs as **AGENT** tiles. Each tile shows the issue the agent is working on, the tool it is running, and a live feed of the current run. There is nothing to set up: the arcade reads the profile `multica login` writes (`~/.multica/config.json`), and the token never reaches the browser.
+
+- **Quick actions** queue work for an agent in one click. Each one creates a `todo` issue assigned to that agent, which starts its run. A focused agent also takes a free-form task, and CANCEL RUN stops the current run.
+- **AUTOPILOTS** lists the workspace's autopilots with a **RUN NOW** button that fires one outside its schedule.
+- Idle and offline agents start on the BENCH. Working and queued agents are in play.
+
+| Agents in play | An agent's live run | Autopilots |
+|---|---|---|
+| ![Agents](docs/screenshots/agents.png) | ![Agent focus](docs/screenshots/focus-agent.png) | ![Autopilots](docs/screenshots/autopilots.png) |
+
 ## How it works
 
 The default worktree mode follows these steps; in-place mode skips snapshot,
@@ -163,6 +175,24 @@ Optional. `~/.config/farmout/config.json`, also editable from the arcade's SETUP
 ```
 
 Built-in routing when there's no `routing` key: review => codex, bulk-read => kiro, research => kiro, implement => cursor, second-opinion => copilot, each with a fallback. `workers.kiro.engine` picks Kiro's agent engine (`v1`, `v2` or `v3`; default `v2`). On `v3` the arcade shows no credit count, since v3 doesn't report metering in its event stream. Jobs live in `~/.cache/farmout` (override with `FARMOUT_HOME`).
+
+The arcade's Multica panel has its own optional section (bash ignores it):
+
+```json
+{
+  "multica": {
+    "enabled": null,
+    "profile": null,
+    "quick_actions": [
+      { "label": "CHECK MY PRS", "title": "Check my open pull requests",
+        "prompt": "Report CI, reviews and conflicts on each open PR; fix what's small.", "agents": null },
+      { "label": "NIGHTLY SWEEP", "title": "Nightly sweep", "prompt": "...", "agents": ["Janitor"] }
+    ]
+  }
+}
+```
+
+`enabled: null` turns the panel on whenever the Multica CLI is logged in, and `profile` picks a named CLI profile. Each quick action becomes the title and description of the issue it creates. `agents` limits an action to the named agents, and `null` offers it to every agent. Without a `quick_actions` key you get CHECK MY PRS and CLEANUP & MERGE; `[]` means none. `MULTICA_SERVER_URL`, `MULTICA_TOKEN` and `MULTICA_WORKSPACE_ID` override the profile, as they do for the CLI.
 
 `limits.in_place_max` defaults to 3 and accepts integers from 1 through 32.
 It caps running in-place jobs per checkout in addition to the global `max_jobs`

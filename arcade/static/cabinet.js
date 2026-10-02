@@ -3,7 +3,7 @@ import { sprite } from './sprite.js';
 
 const SCAN = html`<div style="position:absolute; inset:0; pointer-events:none; background:repeating-linear-gradient(0deg, rgba(0,0,0,.28) 0 1px, transparent 1px 3px);"></div>`;
 
-function Tile({ item, blink, px, stageMin, onOpen, onBench, benchLabel }) {
+function Tile({ item, blink, px, stageMin, onOpen, onBench, benchLabel, onQuick }) {
   return html`
     <div class="h-tile" onClick=${() => onOpen(item.id)} style="position:relative; display:flex; flex-direction:column; gap:7px; min-width:0; min-height:0; padding:12px 14px; background:#1a1817; border:2px ${item.bStyle} ${item.bColor}; cursor:pointer; overflow:hidden; font-family:'Press Start 2P',monospace; opacity:${item.dim};">
       <div style="position:absolute; left:0; right:0; top:0; height:4px; background:${item.topBar};"></div>
@@ -11,8 +11,8 @@ function Tile({ item, blink, px, stageMin, onOpen, onBench, benchLabel }) {
         <div style="font-size:7px; line-height:1; padding:3px 4px; background:${item.badgeBg}; border:2px solid ${item.badgeBd};">${item.badge}</div>
         <div style="font-size:10px; line-height:1;">${item.name}</div>
         <div style="flex:1;"></div>
-        <div style="font-size:7px; color:var(--color-neutral-500);">SCORE</div>
-        <div style="font-size:9px;">${item.score}</div>
+        ${!item.isAgent && html`<div style="font-size:7px; color:var(--color-neutral-500);">SCORE</div>
+        <div style="font-size:9px;">${item.score}</div>`}
         <div class="h-bdacc" onClick=${e => { e.stopPropagation(); onBench(item.id); }} style="font-size:7px; line-height:1; padding:4px 5px; border:2px solid #605d5d; color:var(--color-neutral-400); cursor:pointer;">${benchLabel}</div>
       </div>
       <div style="flex:none; font-family:var(--font-body); font-size:17px; font-weight:800; line-height:1.2; color:var(--color-bg); display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;">${item.mission}</div>
@@ -36,6 +36,14 @@ function Tile({ item, blink, px, stageMin, onOpen, onBench, benchLabel }) {
             ${item.bar.map(b => html`<div style="flex:1; height:8px; background:${b.c};"></div>`)}
           </div>
           <div style="font-size:7px;">${item.barVal}</div>
+        </div>`}
+      ${item.isAgent && html`
+        <div style="flex:none; display:flex; align-items:center; gap:6px; min-width:0; overflow:hidden;">
+          <div style="flex:none; font-size:7px; color:var(--color-neutral-500);">QUICK</div>
+          ${item.quick.map(q => html`<div class="h-bdacc" title="Queue this task for ${item.name}" onClick=${e => { e.stopPropagation(); onQuick(item.id, q.i); }} style="flex:none; font-size:7px; line-height:1; padding:4px 5px; border:2px solid #f0a830; color:#f0a830; cursor:pointer; white-space:nowrap;">${q.label}</div>`)}
+          ${item.quick.length === 0 && html`<div style="font-size:7px; color:var(--color-neutral-600);">NONE SET</div>`}
+          <div style="flex:1;"></div>
+          <div style="flex:none; display:flex; gap:3px;">${item.queue.map(c => html`<div style="width:8px; height:8px; background:${c.c};"></div>`)}</div>
         </div>`}
       ${item.isClaude && html`
         <div style="flex:none; display:flex; align-items:center; gap:8px;">
@@ -98,7 +106,7 @@ function Live({ v }) {
           ${row.real && html`
             <div style="flex:1; min-height:0; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px;">
               ${row.tiles.map(item => item.real
-                ? html`<${Tile} key=${item.id + ':' + item.statusKey} item=${item} blink=${v.blink} px=${v.px} stageMin=${v.stageMin} onOpen=${v.onOpen} onBench=${v.onBench} benchLabel=${v.benchLabel} />`
+                ? html`<${Tile} key=${item.id + ':' + item.statusKey} item=${item} blink=${v.blink} px=${v.px} stageMin=${v.stageMin} onOpen=${v.onOpen} onBench=${v.onBench} benchLabel=${v.benchLabel} onQuick=${v.onQuick} />`
                 : html`<${EmptyTile} blink=${v.blink} />`)}
             </div>`}
         </div>`)}
@@ -108,6 +116,8 @@ function Live({ v }) {
       <div style="width:2px; height:18px; background:#605d5d;"></div>
       <div style="display:flex; align-items:center; gap:8px;"><div style="font-size:7px; padding:3px 4px; background:var(--color-accent); border:2px solid var(--color-accent); color:var(--color-bg);">CONTROL</div>CLAUDE SESSION</div>
       <div style="display:flex; align-items:center; gap:8px;"><div style="font-size:7px; padding:3px 4px; border:2px solid #9b9797; color:var(--color-bg);">PLAYER</div>WORKER JOB</div>
+      ${v.mc && html`<div style="display:flex; align-items:center; gap:8px;"><div style="font-size:7px; padding:3px 4px; border:2px solid #f0a830; color:var(--color-bg);">AGENT</div>MULTICA</div>
+        <div title=${v.mc.title} style="color:${v.mc.color}; cursor:help;">${v.mc.label}</div>`}
       ${v.errors.length > 0 && html`<div title=${v.errors.join('\n')} style="color:#f0a830; cursor:help;">${v.errors.length} SOURCE ERROR${v.errors.length === 1 ? '' : 'S'}</div>`}
       <div style="flex:1;"></div>
       <div style="display:flex; gap:6px;">

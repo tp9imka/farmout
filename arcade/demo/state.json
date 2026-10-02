@@ -5,8 +5,8 @@
   "errors": [],
   "hud": {
     "score": 1234567,
-    "live": 8,
-    "shown": 10,
+    "live": 10,
+    "shown": 15,
     "credits": 0.19,
     "premium": 3
   },
@@ -587,5 +587,314 @@
       "route": null,
       "out": []
     }
-  ]
+  ],
+  "multica": {
+    "enabled": true,
+    "connected": true,
+    "error": null,
+    "why": null,
+    "server": "http://localhost:8080",
+    "app_url": "http://localhost:3000",
+    "workspace": {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "name": "Acme",
+      "slug": "acme"
+    },
+    "updated": 1790167372531,
+    "quick_actions": [
+      {
+        "i": 0,
+        "label": "CHECK MY PRS",
+        "title": "Check my open pull requests",
+        "prompt": "Go through my open pull requests. For each one report CI status, review state and merge conflicts. Fix small, clearly in-scope problems and push; list anything that needs me.",
+        "agents": null
+      },
+      {
+        "i": 1,
+        "label": "CLEANUP & MERGE",
+        "title": "Clean up and merge ready pull requests",
+        "prompt": "Find my pull requests that are approved, green and conflict-free. Merge them, delete their branches, and close or update the issues they resolve.",
+        "agents": null
+      }
+    ],
+    "agents": [
+      {
+        "id": "aaaaaaaa-0000-4000-8000-000000000001",
+        "name": "Orchestrator",
+        "description": "Lead agent: triages the board and hands work to the others.",
+        "status": "working",
+        "model": "claude-opus-5-5",
+        "provider": "claude",
+        "runtime": {
+          "name": "laptop",
+          "status": "online"
+        },
+        "max_concurrent": 2,
+        "task": {
+          "id": "cccccccc-0000-4000-8000-000000000001",
+          "status": "running",
+          "issue": {
+            "id": "dddddddd-0000-4000-8000-000000000001",
+            "identifier": "ACM-41",
+            "title": "Check my open pull requests"
+          },
+          "started": 1790166960531,
+          "created": 1790166942531,
+          "elapsed_s": 412,
+          "completed": null,
+          "branch": null,
+          "work_dir": "~/multica_workspaces/acme/cccccccc",
+          "attempt": 1,
+          "max_attempts": 2,
+          "kind": "issue",
+          "error": null
+        },
+        "queue": [
+          {
+            "id": "cccccccc-0000-4000-8000-000000000002",
+            "status": "queued",
+            "issue": {
+              "id": "dddddddd-0000-4000-8000-000000000002",
+              "identifier": "ACM-42",
+              "title": "Clean up and merge ready pull requests"
+            },
+            "started": null,
+            "created": 1790167312531,
+            "elapsed_s": null,
+            "completed": null,
+            "branch": null,
+            "work_dir": null,
+            "attempt": 0,
+            "max_attempts": 2,
+            "kind": "issue",
+            "error": null
+          }
+        ],
+        "last": null,
+        "replay": [
+          {
+            "t": 1790166972531,
+            "m": "Listing open pull requests for tp9imka"
+          },
+          {
+            "t": 1790166992531,
+            "m": "\u25b8 Bash gh pr list --author @me --json number,title,statusCheckRollup"
+          },
+          {
+            "t": 1790167072531,
+            "m": "#212 is green and approved; #215 has a failing lint job"
+          },
+          {
+            "t": 1790167172531,
+            "m": "\u25b8 Bash npm run lint -- --fix"
+          },
+          {
+            "t": 1790167282531,
+            "m": "\u25b8 Bash git push origin fix/lint-215"
+          },
+          {
+            "t": 1790167352531,
+            "m": "Pushed the lint fix to #215; waiting on CI"
+          }
+        ],
+        "tool": "Bash",
+        "url": "http://localhost:3000/acme/agents/aaaaaaaa-0000-4000-8000-000000000001",
+        "issue_base": "http://localhost:3000/acme/issues/"
+      },
+      {
+        "id": "aaaaaaaa-0000-4000-8000-000000000002",
+        "name": "Builder",
+        "description": null,
+        "status": "working",
+        "model": "gpt-5.5-codex",
+        "provider": "codex",
+        "runtime": {
+          "name": "laptop",
+          "status": "online"
+        },
+        "max_concurrent": 1,
+        "task": {
+          "id": "cccccccc-0000-4000-8000-000000000003",
+          "status": "running",
+          "issue": {
+            "id": "dddddddd-0000-4000-8000-000000000003",
+            "identifier": "ACM-38",
+            "title": "Export: stream CSV instead of buffering"
+          },
+          "started": 1790165852531,
+          "created": 1790165772531,
+          "elapsed_s": 1520,
+          "completed": null,
+          "branch": "agent/builder/acm-38",
+          "work_dir": null,
+          "attempt": 1,
+          "max_attempts": 2,
+          "kind": "issue",
+          "error": null
+        },
+        "queue": [],
+        "last": null,
+        "replay": [
+          {
+            "t": 1790165872531,
+            "m": "\u25b8 Read src/export/csv.ts"
+          },
+          {
+            "t": 1790166272531,
+            "m": "\u25b8 Edit src/export/csv.ts"
+          },
+          {
+            "t": 1790167342531,
+            "m": "\u25b8 Bash npm test -- export"
+          }
+        ],
+        "tool": "Bash",
+        "url": null,
+        "issue_base": "http://localhost:3000/acme/issues/"
+      },
+      {
+        "id": "aaaaaaaa-0000-4000-8000-000000000003",
+        "name": "Reviewer",
+        "description": null,
+        "status": "queued",
+        "model": null,
+        "provider": "copilot",
+        "runtime": {
+          "name": "ci-box",
+          "status": "online"
+        },
+        "max_concurrent": 1,
+        "task": null,
+        "queue": [
+          {
+            "id": "cccccccc-0000-4000-8000-000000000004",
+            "status": "queued",
+            "issue": {
+              "id": "dddddddd-0000-4000-8000-000000000004",
+              "identifier": "ACM-39",
+              "title": "Review payments refactor"
+            },
+            "started": null,
+            "created": 1790167332531,
+            "elapsed_s": null,
+            "completed": null,
+            "branch": null,
+            "work_dir": null,
+            "attempt": 0,
+            "max_attempts": 2,
+            "kind": "issue",
+            "error": null
+          }
+        ],
+        "last": null,
+        "replay": [],
+        "tool": null,
+        "url": null,
+        "issue_base": "http://localhost:3000/acme/issues/"
+      },
+      {
+        "id": "aaaaaaaa-0000-4000-8000-000000000004",
+        "name": "Janitor",
+        "description": null,
+        "status": "idle",
+        "model": null,
+        "provider": "kiro",
+        "runtime": {
+          "name": "ci-box",
+          "status": "online"
+        },
+        "max_concurrent": 1,
+        "task": null,
+        "queue": [],
+        "last": {
+          "id": "cccccccc-0000-4000-8000-000000000005",
+          "status": "failed",
+          "issue": {
+            "id": "dddddddd-0000-4000-8000-000000000005",
+            "identifier": "ACM-35",
+            "title": "Prune stale branches"
+          },
+          "started": 1790158372531,
+          "created": 1790158272531,
+          "elapsed_s": null,
+          "completed": 1790159372531,
+          "branch": null,
+          "work_dir": null,
+          "attempt": 2,
+          "max_attempts": 2,
+          "kind": "issue",
+          "error": "git push rejected: protected branch"
+        },
+        "replay": [],
+        "tool": null,
+        "url": null,
+        "issue_base": "http://localhost:3000/acme/issues/"
+      },
+      {
+        "id": "aaaaaaaa-0000-4000-8000-000000000005",
+        "name": "Nightly",
+        "description": null,
+        "status": "offline",
+        "model": null,
+        "provider": "cursor",
+        "runtime": {
+          "name": "desktop",
+          "status": "offline"
+        },
+        "max_concurrent": 1,
+        "task": null,
+        "queue": [],
+        "last": null,
+        "replay": [],
+        "tool": null,
+        "url": null,
+        "issue_base": "http://localhost:3000/acme/issues/"
+      }
+    ],
+    "autopilots": [
+      {
+        "id": "eeeeeeee-0000-4000-8000-000000000001",
+        "title": "Morning PR sweep",
+        "status": "active",
+        "description": "Check every open PR: CI, reviews, conflicts. Fix what's small.",
+        "agent": "Orchestrator",
+        "assignee_type": "agent",
+        "mode": "create_issue",
+        "triggers": [
+          "schedule"
+        ],
+        "next_run": 1790239372531,
+        "last_run": 1790152972531
+      },
+      {
+        "id": "eeeeeeee-0000-4000-8000-000000000002",
+        "title": "Cleanup & merge",
+        "status": "active",
+        "description": "Merge green, approved PRs and delete their branches.",
+        "agent": "Orchestrator",
+        "assignee_type": "agent",
+        "mode": "create_issue",
+        "triggers": [
+          "schedule",
+          "webhook"
+        ],
+        "next_run": 1790178172531,
+        "last_run": 1790091772531
+      },
+      {
+        "id": "eeeeeeee-0000-4000-8000-000000000003",
+        "title": "Dependency audit",
+        "status": "paused",
+        "description": "Weekly npm audit and upgrade PR.",
+        "agent": "Janitor",
+        "assignee_type": "agent",
+        "mode": "create_issue",
+        "triggers": [
+          "schedule"
+        ],
+        "next_run": null,
+        "last_run": 1789648972531
+      }
+    ]
+  }
 }

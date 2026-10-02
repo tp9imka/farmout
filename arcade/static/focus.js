@@ -7,7 +7,7 @@ const CREW_PX = 3;
 const SCAN = html`<div style="position:absolute; inset:0; pointer-events:none; background:repeating-linear-gradient(0deg, rgba(0,0,0,.28) 0 1px, transparent 1px 3px);"></div>`;
 
 const Tag = ({ t, size = 9, pad = '5px 6px' }) => html`
-  <div style="font-size:${size}px; line-height:1; padding:${pad}; background:${t.bg}; color:${t.fg}; border:2px ${t.bs} ${t.bd}; opacity:${t.op};">${t.label}</div>`;
+  <div style="flex:none; white-space:nowrap; font-size:${size}px; line-height:1; padding:${pad}; background:${t.bg}; color:${t.fg}; border:2px ${t.bs} ${t.bd}; opacity:${t.op};">${t.label}</div>`;
 
 const Back = ({ onBack }) => html`
   <div class="h-g8" onClick=${onBack} style="font-size:9px; cursor:pointer; padding:7px 9px; border:2px solid var(--color-bg);">◀ BACK · ESC</div>`;
@@ -172,6 +172,84 @@ export function FocusSession({ fc, onBack, onOpen, onAsk, busy, actionMsg }) {
           <div style="display:flex; flex-direction:column; gap:8px; padding:16px 18px; background:#1a1817; border:2px solid #444141; overflow:hidden;">
             <div style="font-size:8px; color:var(--color-neutral-500); margin-bottom:4px;">${fc.items}</div>
             ${fc.files.map(fl => html`<${FileRow} fl=${fl} />`)}
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+const FIELD = 'width:100%; box-sizing:border-box; font-family:var(--font-body); font-size:14px; padding:8px 10px; background:#0e0d0d; color:var(--color-bg); border:2px solid #605d5d; border-radius:0;';
+const BTN = 'font-size:9px; padding:9px 11px; cursor:pointer; white-space:nowrap;';
+
+const Link = ({ href, label }) => href
+  ? html`<a href=${href} target="_blank" rel="noopener noreferrer" style="font-size:8px; text-decoration:none;">${label} ↗</a>`
+  : null;
+
+const TaskRow = ({ t }) => html`
+  <div style="display:grid; grid-template-columns:minmax(0,1fr) 110px 70px; gap:10px; align-items:center; padding:6px 0; border-top:2px solid #262322;">
+    <div style="font-family:var(--font-body); font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+      ${t.url ? html`<a href=${t.url} target="_blank" rel="noopener noreferrer" style="color:var(--color-neutral-200); text-decoration:none;">${t.issue}</a>` : t.issue}
+    </div>
+    <div style="font-size:7px; color:var(--color-neutral-400);">${t.status}</div>
+    <div style="font-size:7px; text-align:right; color:var(--color-neutral-500);">${t.time}</div>
+  </div>`;
+
+export function FocusAgent({ fa, onBack, onAsk, busy, actionMsg, form, onForm }) {
+  const canQueue = !busy && form.title.trim().length > 0;
+  return html`
+    <div style="flex:1; min-height:0; display:grid; grid-template-columns:480px minmax(0,1fr); gap:10px; padding:10px; font-family:'Press Start 2P',monospace;">
+      <div style="position:relative; display:flex; flex-direction:column; gap:14px; padding:20px; background:#1a1817; border:2px solid #f0a830; overflow:hidden;">
+        <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+          <${Back} onBack=${onBack} />
+          <${Link} href=${fa.url} label="OPEN IN MULTICA" />
+        </div>
+        <div style="flex:1; min-height:120px; display:flex; align-items:flex-end; justify-content:center; border-bottom:2px solid #605d5d; padding-bottom:6px;">${sprite(h, 'agent', fa.pose, fa.f, BIG_PX - 4)}</div>
+        <div style="display:flex; align-items:center; gap:12px;">
+          <div style="font-size:8px; padding:4px 5px; border:2px solid #f0a830;">AGENT</div>
+          <div style="font-size:16px; line-height:1.3; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${fa.name}</div>
+          <div style="flex:1;"></div>
+          <${Tag} t=${fa.tag} />
+        </div>
+        <div style="font-family:var(--font-body); font-size:14px; color:var(--color-neutral-400);">${fa.sub} · ${fa.model}</div>
+        <div style="display:flex; flex-direction:column; gap:8px;">
+          <div style="font-size:7px; color:var(--color-neutral-500);">QUICK ACTIONS · QUEUE A TASK</div>
+          <div style="display:flex; flex-wrap:wrap; gap:6px;">
+            ${fa.quickAll.map(q => html`<div class="h-g8" title=${q.title} onClick=${() => !busy && onAsk('mc-quick', { quick: q.i, title: q.title })} style="${BTN} border:2px solid #f0a830; color:#f0a830; opacity:${busy ? '0.4' : '1'};">${q.label}</div>`)}
+            ${fa.quickAll.length === 0 && html`<div style="font-family:var(--font-body); font-size:13px; color:var(--color-neutral-500);">No quick actions for this agent. Add them under multica.quick_actions in the farmout config.</div>`}
+          </div>
+          <input value=${form.title} maxlength="200" placeholder="New task title" onInput=${e => onForm({ title: e.target.value })} style=${FIELD} />
+          <textarea value=${form.prompt} maxlength="4000" rows="3" placeholder="What should ${fa.name} do? (optional brief)" onInput=${e => onForm({ prompt: e.target.value })} style="${FIELD} resize:vertical;"></textarea>
+          <div style="display:flex; gap:8px;">
+            <div class="h-land" onClick=${() => canQueue && onAsk('mc-queue', { title: form.title.trim(), prompt: form.prompt })} style="${BTN} background:var(--color-accent); border:2px solid var(--color-accent); opacity:${canQueue ? '1' : '0.4'};">QUEUE TASK</div>
+            ${fa.canCancel && html`<div class="h-g8" onClick=${() => !busy && onAsk('mc-cancel', { task: fa.cancelId })} style="${BTN} border:2px solid var(--color-accent); color:var(--color-accent); opacity:${busy ? '0.4' : '1'};">CANCEL RUN</div>`}
+          </div>
+        </div>
+        ${actionMsg && html`<div style="font-size:8px; line-height:1.6; color:#f0a830;">${actionMsg}</div>`}
+        ${SCAN}
+      </div>
+      <div style="display:flex; flex-direction:column; gap:10px; min-width:0; min-height:0;">
+        <div style="display:flex; flex-direction:column; gap:12px; padding:18px 20px; background:#1a1817; border:2px solid #444141;">
+          <div style="display:flex; gap:12px; align-items:center;"><div style="font-size:8px; color:var(--color-neutral-500);">MISSION</div><div style="flex:1;"></div><${Link} href=${fa.missionUrl} label="ISSUE" /></div>
+          <div style="font-family:var(--font-body); font-size:22px; font-weight:800; line-height:1.2;">${fa.mission}</div>
+          ${fa.description && html`<div style="font-family:var(--font-body); font-size:15px; line-height:1.5; color:var(--color-neutral-300); text-wrap:pretty;">${fa.description}</div>`}
+        </div>
+        <div style="display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); background:#1a1817; border:2px solid #444141;">
+          ${fa.meta.map(m => html`
+            <div style="display:flex; flex-direction:column; gap:8px; padding:12px 16px; min-width:0; border-right:2px solid #2d2b2b; border-bottom:2px solid #2d2b2b; grid-column:${m.span};">
+              <div style="font-size:7px; color:var(--color-neutral-500);">${m.k}</div>
+              <div style="font-family:var(--font-body); font-size:15px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${m.v}</div>
+            </div>`)}
+        </div>
+        <div style="flex:1; min-height:0; display:grid; grid-template-columns:minmax(0,1.5fr) minmax(0,1fr); gap:10px;">
+          <${Replay} title="LIVE · CURRENT RUN" lines=${fa.replay} />
+          <div style="display:flex; flex-direction:column; gap:8px; min-width:0; padding:16px 18px; background:#1a1817; border:2px solid #444141; overflow:auto;">
+            <div style="font-size:8px; color:var(--color-neutral-500);">QUEUE · ${fa.queueList.length}</div>
+            ${fa.queueList.map(t => html`<${TaskRow} t=${t} />`)}
+            ${fa.queueList.length === 0 && html`<div style="font-family:var(--font-body); font-size:13px; color:var(--color-neutral-500);">Nothing waiting.</div>`}
+            ${fa.lastRow && html`
+              <div style="font-size:8px; color:var(--color-neutral-500); margin-top:12px;">LAST FINISHED</div>
+              <${TaskRow} t=${fa.lastRow} />`}
+            ${fa.lastError && html`<div style="font-family:var(--font-body); font-size:13px; line-height:1.5; color:var(--color-accent);">${fa.lastError}</div>`}
           </div>
         </div>
       </div>

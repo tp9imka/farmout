@@ -26,6 +26,7 @@ import webbrowser
 
 import config
 import model_jobs
+import multica
 import model_sessions
 
 DEFAULT_PORT = 7456
@@ -46,8 +47,12 @@ TOKEN_HEADER = "X-Arcade-Token"
 JOB_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[a-z]+-[0-9a-f]{4}$")
 _JOB_ACTION_RE = re.compile(r"^/api/jobs/([^/]+)/(kill|land|discard|accept)$")
 _SESSION_END_RE = re.compile(r"^/api/sessions/([^/]+)/end$")
+_MULTICA_ACTION_RE = re.compile(r"^/api/multica/(tasks|autopilots|agents)/([^/]+)/(cancel|trigger|queue)$")
+_MULTICA_VERBS = {"tasks": "cancel", "autopilots": "trigger", "agents": "queue"}
+QUEUE_TITLE_MAX = config.QUICK_TITLE_MAX
+QUEUE_PROMPT_MAX = config.QUICK_PROMPT_MAX
 SESSION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-_STATE_KEYS = ("now", "stall_min", "machine", "errors", "hud", "sessions", "jobs", "hof", "behind_s")
+_STATE_KEYS = ("now", "stall_min", "machine", "errors", "hud", "sessions", "jobs", "hof", "multica", "behind_s")
 
 _EXTRA_CONTENT_TYPES = {".mjs": "text/javascript", ".woff2": "font/woff2", ".ttf": "font/ttf"}
 
@@ -86,7 +91,7 @@ def _numeric(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
-def compute_hud(sessions, jobs, today_totals):
+def compute_hud(sessions, jobs, today_totals, agents=()):
     """HI-SCORE/IN PLAY/COINS for the header. `today_totals` is
     JobsModel.snapshot()'s {score, credits, premium} aggregate over every
     job started today -- not just jobs[] or the HOF_MAX-capped hof[], so
@@ -97,7 +102,8 @@ def compute_hud(sessions, jobs, today_totals):
     # A suspended (stopped) process is not in play, whatever else it looks like.
     live = sum(1 for s in sessions if s.get("status") in LIVE_SESSION_STATUSES)
     live += sum(1 for j in jobs if j.get("status") in ("running", "lost"))
-    shown = len(sessions) + len(jobs)
+    live += sum(1 for a in agents if a.get("status") == "working")
+    shown = len(sessions) + len(jobs) + len(agents)
 
     return {
         "score": int(score),
@@ -201,8 +207,12 @@ class ArcadeHTTPServer(http.server.ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, addr, handler_cls, *, token, farmout_bin, farmout_home,
-                 claude_home, config_path, static_dir, state_wait_s=STATE_WAIT_S):
-        # Before the bind: a failed bind calls server_close(), which closes it.
+                 claude_home, config_path, static_dir, state_wait_s=STATE_WAIT_S,
+                 multica_config_dir=None, multica_poll_s=multica.POLL_S):
+        # Before the bind: a failed bind calls server_close(), which closes them.
+        self.config_path = config_path
+        self.multica_config_dir = multica_config_dir
+        self.multica = multica.MulticaSource(self._multica_settings, poll_s=multica_poll_s)
         self.jobs_model = model_jobs.JobsModel(farmout_home, background_files=True)
         self.state_builder = StateBuilder(self.build_state, state_wait_s)
         super().__init__(addr, handler_cls)
@@ -216,6 +226,7 @@ class ArcadeHTTPServer(http.server.ThreadingHTTPServer):
         self.job_locks = _JobLocks()
 
     def server_close(self):
+        self.multica.close()
         self.jobs_model.close()
         self.state_builder.close()
         super().server_close()
@@ -234,7 +245,10 @@ class ArcadeHTTPServer(http.server.ThreadingHTTPServer):
             + ["config: " + w for w in cfg_warnings]
             + ["config: " + e for e in config.validate(cfg)]
         )
-        hud = compute_hud(sessions_snap["sessions"], jobs_snap["jobs"], jobs_snap["today"])
+        mc = self.multica_state(cfg)
+        if mc["enabled"] and mc["error"]:
+            errors.append("multica: " + mc["error"])
+        hud = compute_hud(sessions_snap["sessions"], jobs_snap["jobs"], jobs_snap["today"], mc["agents"])
         state = {
             "now": now_ms,
             "stall_min": stall_min,
@@ -244,10 +258,24 @@ class ArcadeHTTPServer(http.server.ThreadingHTTPServer):
             "sessions": sessions_snap["sessions"],
             "jobs": jobs_snap["jobs"],
             "hof": jobs_snap["hof"],
+            "multica": mc,
             "behind_s": 0,
         }
         assert set(state) == set(_STATE_KEYS)
         return state
+
+    def _multica_settings(self):
+        cfg, _ = config.load(self.config_path)
+        return multica.resolve_settings(cfg["multica"], config_dir=self.multica_config_dir)
+
+    def multica_state(self, cfg):
+        """The Multica poller's last view plus the configured quick actions."""
+        mc = dict(self.multica.snapshot())
+        mc["quick_actions"] = [
+            {"i": i, "label": qa["label"], "title": qa["title"], "prompt": qa["prompt"], "agents": qa["agents"]}
+            for i, qa in enumerate(cfg["multica"]["quick_actions"])
+        ]
+        return mc
 
     def handle_error(self, request, client_address):
         # The stdlib default prints the full traceback (request included)
@@ -512,6 +540,18 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
             self._handle_doctor()
             return
 
+        m = _MULTICA_ACTION_RE.match(path)
+        if m:
+            kind, target, verb = m.groups()
+            if _MULTICA_VERBS[kind] != verb:
+                self._deny(404, "not found")
+                return
+            if not multica.UUID_RE.fullmatch(target):
+                self._deny(400, "bad id")
+                return
+            self._handle_multica_action(kind, target, verb)
+            return
+
         m = _SESSION_END_RE.match(path)
         if m:
             if not SESSION_ID_RE.fullmatch(m.group(1)):
@@ -686,6 +726,77 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
             return
         self._json(200, {"ok": code == 0, "code": code, "timed_out": timed_out, "out": out, "err": err})
 
+    # -- multica ---------------------------------------------------------
+
+    def _read_json_body(self):
+        """(body_dict, error_response). An absent body reads as {}."""
+        length, length_err = self._parse_content_length()
+        if length_err == "too_large":
+            return None, (413, "request body exceeds {} bytes".format(MAX_BODY_BYTES))
+        if length_err == "invalid":
+            return None, (400, "invalid Content-Length")
+        raw = self._read_body(length)
+        if not raw:
+            return {}, None
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None, (400, "invalid JSON body")
+        if not isinstance(body, dict):
+            return None, (400, "body must be an object")
+        return body, None
+
+    def _queue_request(self, agent_id, body):
+        """(title, prompt, error) for a queue request: a configured quick
+        action by index, or a custom title and prompt."""
+        agent = self.server.multica.agent(agent_id)
+        if agent is None:
+            return None, None, "unknown agent"
+        if "quick" in body:
+            cfg, _ = config.load(self.server.config_path)
+            qas = cfg["multica"]["quick_actions"]
+            i = body.get("quick")
+            if not isinstance(i, int) or isinstance(i, bool) or not 0 <= i < len(qas):
+                return None, None, "unknown quick action"
+            qa = qas[i]
+            if qa["agents"] and agent["name"].lower() not in [a.lower() for a in qa["agents"]]:
+                return None, None, "quick action is not for this agent"
+            return qa["title"], qa["prompt"], None
+        title, prompt = body.get("title"), body.get("prompt") or ""
+        if not isinstance(title, str) or not title.strip() or len(title) > QUEUE_TITLE_MAX:
+            return None, None, "title must be 1..{} characters".format(QUEUE_TITLE_MAX)
+        if not isinstance(prompt, str) or len(prompt) > QUEUE_PROMPT_MAX:
+            return None, None, "prompt must be at most {} characters".format(QUEUE_PROMPT_MAX)
+        return title.strip(), prompt, None
+
+    def _handle_multica_action(self, kind, target, verb):
+        body, body_err = self._read_json_body()
+        if body_err:
+            self._json(body_err[0], {"ok": False, "err": body_err[1]})
+            return
+        key = "multica:" + target
+        if not self.server.job_locks.try_acquire(key):
+            self._json(409, {"ok": False, "err": "another action is running on this target"})
+            return
+        try:
+            src = self.server.multica
+            if verb == "cancel":
+                result = src.cancel_task(target)
+            elif verb == "trigger":
+                result = src.trigger_autopilot(target)
+            else:
+                title, prompt, err = self._queue_request(target, body)
+                if err:
+                    self._json(400, {"ok": False, "err": err})
+                    return
+                result = src.queue_task(target, title, prompt)
+        except multica.MulticaError as exc:
+            self._json(502, {"ok": False, "err": str(exc)})
+            return
+        finally:
+            self.server.job_locks.release(key)
+        self._json(200, result)
+
     def _handle_doctor(self):
         code, out, err, _ = self._run_farmout(["doctor", "--json"])
         try:
@@ -697,12 +808,12 @@ class ArcadeHandler(http.server.BaseHTTPRequestHandler):
 
 
 def build_server(port, token, *, farmout_bin, farmout_home, claude_home, config_path, static_dir,
-                 state_wait_s=STATE_WAIT_S):
+                 state_wait_s=STATE_WAIT_S, multica_config_dir=None, multica_poll_s=multica.POLL_S):
     return ArcadeHTTPServer(
         ("127.0.0.1", port), ArcadeHandler,
         token=token, farmout_bin=farmout_bin, farmout_home=farmout_home,
         claude_home=claude_home, config_path=config_path, static_dir=static_dir,
-        state_wait_s=state_wait_s,
+        state_wait_s=state_wait_s, multica_config_dir=multica_config_dir, multica_poll_s=multica_poll_s,
     )
 
 
